@@ -102,6 +102,12 @@ TIMEOUT_BACKOFF_BASE     = 30
 STORY_ID_LEARN_AFTER  = 12
 STORY_ID_MAX_ATTEMPTS = 3
 
+# ── Ads filter ────────────────────────────────────────────────────────────────
+# AI scan watermark mỗi N chương — đủ thưa để không tốn quota,
+# đủ dày để học pattern sớm trong truyện ngắn.
+# Với free tier 3 RPM: scan mỗi 5 ch → tối đa 0.2 RPM overhead, chấp nhận được.
+ADS_AI_SCAN_EVERY = 5
+
 # ── Misc ──────────────────────────────────────────────────────────────────────
 PROFILES_FILE  = "site_profiles.json"
 INIT_STAGGER   = 1.5

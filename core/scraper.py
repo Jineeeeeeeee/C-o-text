@@ -10,6 +10,20 @@ Fixes applied:
           Chỉ giữ lại khi domain thay đổi đột ngột (cross-domain jump).
   FIX-C: `_extract_content_ai` được inline vào `scrape_one_chapter`
           để có thể chia sẻ biến cache — hàm cũ bị xóa.
+  FIX-D: Wire `ai_validate_title` khi majority vote hòa (extractors.py).
+
+  ADS-1: Wire `SimpleAdsFilter` vào pipeline.
+          Mỗi run_novel_task tạo 1 instance riêng biệt.
+          Filter chạy SAU clean_chapter_text, TRƯỚC fingerprint.
+          Lý do thứ tự: fingerprint phải hash nội dung sạch để phát hiện
+          loop chính xác. Nếu hash nội dung bẩn, 2 chapter giống nhau
+          có thể có fingerprint khác nhau do ads text khác nhau.
+
+  ADS-2: AI scan mỗi ADS_AI_SCAN_EVERY chương.
+          Dùng content_before_filter (nội dung chưa lọc) để AI có context
+          đầy đủ, sau đó cập nhật filter để các chương sau được lọc tốt hơn.
+          Scan từ chương đầu tiên (chapter_num % scan_every == 1) để bắt
+          watermark sớm trong truyện ngắn.
 """
 from __future__ import annotations
 
@@ -29,6 +43,7 @@ from config import (
     TIMEOUT_BACKOFF_BASE,
     STORY_ID_LEARN_AFTER,
     STORY_ID_MAX_ATTEMPTS,
+    ADS_AI_SCAN_EVERY,
     get_delay_seconds,
 )
 from utils.file_io import load_progress, save_progress, write_markdown, save_profiles
@@ -38,6 +53,7 @@ from utils.string_helpers import (
     extract_text_blocks,
 )
 from utils.types import AiClassifyResult, ProgressDict, SiteProfileDict, StoryIdResult
+from utils.ads_filter import SimpleAdsFilter
 from ai.client  import AIRateLimiter
 from ai.agents  import (
     ask_ai_for_story_id,
@@ -45,6 +61,7 @@ from ai.agents  import (
     ai_classify_and_find,
     ask_ai_build_profile,
     ask_ai_confirm_same_story,
+    ai_detect_ads_content,
 )
 from core.fetch       import fetch_page
 from core.navigator   import find_next_url, detect_page_type
@@ -198,6 +215,7 @@ async def scrape_one_chapter(
     profiles_lock: asyncio.Lock,
     ai_limiter: AIRateLimiter,
     title_extractor: TitleExtractor,
+    ads_filter: SimpleAdsFilter,
 ) -> str | None:
     all_visited: set[str] = set(progress.get("all_visited_urls") or [])
 
@@ -210,7 +228,7 @@ async def scrape_one_chapter(
         print(f"  [End] 🏁 Hết truyện hoặc trang lỗi: {url[:60]}", flush=True)
         return None
 
-    # CPU-bound: parse + clean
+    # CPU-bound: parse + clean (bao gồm remove_hidden_elements với dynamic CSS fix)
     soup, clean_html = await asyncio.to_thread(_sync_parse_and_clean, html)
 
     domain  = urlparse(url).netloc.lower()
@@ -246,7 +264,18 @@ async def scrape_one_chapter(
 
     content = clean_chapter_text(content)
 
-    # Fingerprint
+    # ── ADS-1: Filter ads/watermark plain-text ────────────────────────────────
+    # Chạy SAU clean_chapter_text, TRƯỚC fingerprint.
+    # Lưu content_before để gửi lên AI với context đầy đủ (có dòng ads).
+    content_before_filter = content
+    content = ads_filter.filter_content(content)
+
+    removed_chars = len(content_before_filter) - len(content)
+    if removed_chars > 0:
+        print(f"  [Ads] 🧹 Đã lọc {removed_chars} ký tự ads khỏi nội dung", flush=True)
+    # ─────────────────────────────────────────────────────────────────────────
+
+    # Fingerprint — dùng content đã lọc để hash chính xác
     fp           = make_fingerprint(content)
     fingerprints = set(progress.get("fingerprints") or [])
     if fp in fingerprints:
@@ -264,8 +293,38 @@ async def scrape_one_chapter(
         if story_title:
             progress["story_title"] = story_title
 
+    # Số thứ tự chương tiếp theo (chapter_count chưa tăng lúc này)
+    chapter_num = progress.get("chapter_count", 0) + 1
+
+    # ── ADS-2: AI scan mỗi ADS_AI_SCAN_EVERY chương ──────────────────────────
+    # Điều kiện: chapter_num % scan_every == 1 → scan chương 1, 6, 11, 16, ...
+    # Lý do dùng == 1 thay vì == 0:
+    #   - chapter_count chưa tăng ở đây nên chapter_num bắt đầu từ 1
+    #   - Scan chương đầu tiên để bắt watermark sớm nhất có thể
+    #   - Với ADS_AI_SCAN_EVERY=5: scan ch.1, 6, 11, 16, ...
+    if chapter_num % ADS_AI_SCAN_EVERY == 1:
+        context_block = ads_filter.build_ai_context_block(content_before_filter)
+        if context_block:
+            print(
+                f"  [Ads] 🤖 AI scan watermark (ch.{chapter_num}, "
+                f"{ads_filter.keyword_count} kw / {ads_filter.pattern_count} pat)...",
+                flush=True,
+            )
+            raw_result = await ai_detect_ads_content(context_block, ai_limiter)
+            if raw_result:
+                added = ads_filter.update_from_ai_result(raw_result)
+                if added:
+                    print(
+                        f"  [Ads] ✅ Học thêm {added} pattern mới "
+                        f"(tổng: {ads_filter.keyword_count} kw / {ads_filter.pattern_count} pat)",
+                        flush=True,
+                    )
+                else:
+                    print(f"  [Ads] ✔ Nội dung sạch, không có pattern mới", flush=True)
+        # context_block là None → không có dòng nghi ngờ → không cần scan
+    # ─────────────────────────────────────────────────────────────────────────
+
     # Ghi file .md
-    chapter_num  = progress.get("chapter_count", 0) + 1
     filename     = f"{chapter_num:04d}_{slugify_filename(title, max_len=60)}.md"
     file_content = f"# {title}\n\n{content}\n"
     await write_markdown(os.path.join(output_dir, filename), file_content)
@@ -334,11 +393,6 @@ async def scrape_one_chapter(
     # ── FIX-B: Cross-domain jump guard ───────────────────────────────────────
     # Thay thế ask_ai_confirm_same_story gọi mỗi chương (broken + expensive)
     # bằng kiểm tra domain đơn giản + chỉ gọi AI khi domain thực sự thay đổi.
-    #
-    # Lý do xóa vòng lặp cũ:
-    #   1. title2="" → AI không đủ thông tin → luôn trả về same_story=True
-    #   2. story_id guard đã xử lý sau ch.12, tốn thêm 1 RPM/ch là lãng phí
-    #   3. Trường hợp thực sự cần: URL nhảy sang domain khác hẳn
     current_domain = urlparse(url).netloc
     next_domain    = urlparse(next_url).netloc
 
@@ -346,8 +400,6 @@ async def scrape_one_chapter(
         not progress.get("story_id_locked")
         and next_domain != current_domain
     ):
-        # Domain thay đổi: gọi AI với title hiện tại (title2 vẫn rỗng vì chưa fetch)
-        # Ở đây ta chỉ cần check URL pattern, không cần title2
         print(
             f"  [Guard] ⚠️ Domain thay đổi: {current_domain} → {next_domain}",
             flush=True,
@@ -355,7 +407,7 @@ async def scrape_one_chapter(
         is_same = await ask_ai_confirm_same_story(
             title1     = title,
             url1       = url,
-            title2     = "",        # chưa fetch trang tiếp → không có title
+            title2     = "",
             url2       = next_url,
             ai_limiter = ai_limiter,
         )
@@ -390,6 +442,7 @@ async def run_novel_task(
     os.makedirs(output_dir, exist_ok=True)
 
     title_extractor      = TitleExtractor()
+    ads_filter           = SimpleAdsFilter()   # ADS-1: 1 instance per novel task
     consecutive_errors   = 0
     consecutive_timeouts = 0
 
@@ -422,6 +475,7 @@ async def run_novel_task(
                 profiles_lock   = profiles_lock,
                 ai_limiter      = ai_limiter,
                 title_extractor = title_extractor,
+                ads_filter      = ads_filter,   # ADS-1: truyền xuống
             )
             consecutive_errors   = 0
             consecutive_timeouts = 0
