@@ -2,28 +2,19 @@
 """
 core/scraper.py — Orchestration: fetch → parse → lưu → điều hướng.
 
-Fixes applied:
-  FIX-A: Cache `ai_classify_and_find` result — tránh gọi 2 lần cùng payload
-          (lần 1 cho content extraction, lần 2 cho next_url).
-  FIX-B: Xóa `ask_ai_confirm_same_story` khỏi vòng lặp per-chapter.
-          Guard này broken (title2="") và redundant khi story_id đã lock.
-          Chỉ giữ lại khi domain thay đổi đột ngột (cross-domain jump).
-  FIX-C: `_extract_content_ai` được inline vào `scrape_one_chapter`
-          để có thể chia sẻ biến cache — hàm cũ bị xóa.
-  FIX-D: Wire `ai_validate_title` khi majority vote hòa (extractors.py).
+FIX-PROFILE-SEL: _sync_extract_content nhận thêm profile parameter.
+  Thứ tự ưu tiên:
+    1. profile["content_selector"] (AI-learned, domain-specific) — ĐỘ CHÍNH XÁC CAO NHẤT
+    2. CONTENT_SELECTORS global list (fallback cho domain quen)
+  Trước đây profile selector bị bỏ qua hoàn toàn → domain mới (novelfire, v.v.)
+  luôn trả về None dù AI đã build đúng profile.
 
-  ADS-1: Wire `SimpleAdsFilter` vào pipeline.
-          Mỗi run_novel_task tạo 1 instance riêng biệt.
-          Filter chạy SAU clean_chapter_text, TRƯỚC fingerprint.
-          Lý do thứ tự: fingerprint phải hash nội dung sạch để phát hiện
-          loop chính xác. Nếu hash nội dung bẩn, 2 chapter giống nhau
-          có thể có fingerprint khác nhau do ads text khác nhau.
-
-  ADS-2: AI scan mỗi ADS_AI_SCAN_EVERY chương.
-          Dùng content_before_filter (nội dung chưa lọc) để AI có context
-          đầy đủ, sau đó cập nhật filter để các chương sau được lọc tốt hơn.
-          Scan từ chương đầu tiên (chapter_num % scan_every == 1) để bắt
-          watermark sớm trong truyện ngắn.
+Fixes từ phiên bản trước vẫn còn:
+  FIX-A: Cache ai_classify_and_find result
+  FIX-B: Cross-domain jump guard
+  FIX-C: _extract_content_ai inline
+  FIX-D: ai_validate_title khi vote hòa
+  ADS-1/2: SimpleAdsFilter wired
 """
 from __future__ import annotations
 
@@ -83,18 +74,53 @@ def _sync_parse_and_clean(html: str) -> tuple[BeautifulSoup, str]:
 
 
 def _sync_detect_page_type(html: str, url: str) -> str:
-    """Wrapper sync cho detect_page_type — parse html → soup rồi gọi."""
     soup = BeautifulSoup(html, "html.parser")
     return detect_page_type(soup, url)
 
 
-def _sync_extract_content(soup: BeautifulSoup) -> str | None:
+def _sync_extract_content(
+    soup: BeautifulSoup,
+    profile: SiteProfileDict | None = None,
+) -> str | None:
+    """
+    Trích nội dung chương từ soup.
+
+    FIX-PROFILE-SEL: Thử profile["content_selector"] TRƯỚC khi dùng
+    CONTENT_SELECTORS global. Domain-specific selector (do AI học) có
+    độ chính xác cao hơn selector cứng.
+
+    Lý do cần fix: scraper cũ bỏ qua hoàn toàn profile selector dù đã
+    build thành công → novelfire.net (và mọi domain lạ) không bao giờ
+    extract được content.
+    """
+    # 1. Profile selector — ưu tiên cao nhất
+    if profile:
+        sel = profile.get("content_selector")
+        if sel:
+            try:
+                el = soup.select_one(sel)
+                if el:
+                    text = extract_text_blocks(el)
+                    if len(text.strip()) > 200:
+                        return text
+                    logger.debug(
+                        "[Extract] Profile selector %r trả về nội dung quá ngắn (%d chars)",
+                        sel, len(text.strip()),
+                    )
+            except Exception as e:
+                logger.debug("[Extract] Profile selector %r lỗi: %s", sel, e)
+
+    # 2. Global CONTENT_SELECTORS — fallback
     for sel in CONTENT_SELECTORS:
-        el = soup.select_one(sel)
-        if el:
-            text = extract_text_blocks(el)
-            if len(text.strip()) > 200:
-                return text
+        try:
+            el = soup.select_one(sel)
+            if el:
+                text = extract_text_blocks(el)
+                if len(text.strip()) > 200:
+                    return text
+        except Exception:
+            continue
+
     return None
 
 
@@ -138,13 +164,8 @@ async def check_and_find_start_chapter(
     """
     Xác định URL chương đầu tiên cần cào.
 
-    - Resume: trả về current_url đã lưu trong progress
-    - Index page: nhờ AI tìm chương đầu
-    - Chapter page: trả về start_url thẳng
-
-    FIX: Sau khi detect "chapter", kiểm tra nhanh có nội dung không.
-    Nếu không có (ví dụ: RoyalRoad fiction index bị phân loại sai do JS),
-    fallback sang index logic để tìm chương đầu.
+    FIX-PROFILE-SEL (check_and_find): Khi kiểm tra có content không,
+    truyền profile vào _sync_extract_content để detect đúng domain mới.
     """
     progress = await load_progress(progress_path)
 
@@ -166,9 +187,12 @@ async def check_and_find_start_chapter(
     page_type = await asyncio.to_thread(_sync_detect_page_type, html, start_url)
 
     if page_type == "chapter":
-        # Xác minh: thực sự có nội dung chương không?
+        domain  = urlparse(start_url).netloc.lower()
+        profile = profiles.get(domain, {})
+
         soup_check, _ = await asyncio.to_thread(_sync_parse_and_clean, html)
-        content_check = await asyncio.to_thread(_sync_extract_content, soup_check)
+        # FIX-PROFILE-SEL: truyền profile để dùng content_selector đúng domain
+        content_check = await asyncio.to_thread(_sync_extract_content, soup_check, profile)
 
         if content_check and len(content_check.strip()) > 200:
             print(f"  [Start] 📖 Bắt đầu từ chương: {start_url[:70]}", flush=True)
@@ -228,7 +252,6 @@ async def scrape_one_chapter(
         print(f"  [End] 🏁 Hết truyện hoặc trang lỗi: {url[:60]}", flush=True)
         return None
 
-    # CPU-bound: parse + clean (bao gồm remove_hidden_elements với dynamic CSS fix)
     soup, clean_html = await asyncio.to_thread(_sync_parse_and_clean, html)
 
     domain  = urlparse(url).netloc.lower()
@@ -241,17 +264,21 @@ async def scrape_one_chapter(
             await _save_new_profile(profiles, domain, new_profile, profiles_lock)
             profile = new_profile
             print(f"  [Profile] ✅ Đã lưu profile cho {domain}", flush=True)
+            # Log selector học được để dễ debug
+            if new_profile.get("content_selector"):
+                print(
+                    f"  [Profile] content_selector: {new_profile['content_selector']!r}",
+                    flush=True,
+                )
 
     # ── Extract nội dung ──────────────────────────────────────────────────────
     # FIX-A: Cache ai_classify_and_find result.
-    # Nếu CSS selectors không tìm được content, gọi AI 1 lần và giữ cache.
-    # Khi cần tìm next_url sau đó, dùng lại cache — không gọi AI lần 2.
+    # FIX-PROFILE-SEL: Truyền profile vào để ưu tiên content_selector AI học.
     ai_classify_cache: AiClassifyResult | None = None
 
-    content = await asyncio.to_thread(_sync_extract_content, soup)
+    content = await asyncio.to_thread(_sync_extract_content, soup, profile)
 
     if content is None:
-        # Gọi AI lần duy nhất — lấy cả page_type lẫn next_url
         ai_classify_cache = await ai_classify_and_find(clean_html, url, ai_limiter)
         if ai_classify_cache and ai_classify_cache.get("page_type") == "chapter":
             body = soup.find("body")
@@ -265,17 +292,14 @@ async def scrape_one_chapter(
     content = clean_chapter_text(content)
 
     # ── ADS-1: Filter ads/watermark plain-text ────────────────────────────────
-    # Chạy SAU clean_chapter_text, TRƯỚC fingerprint.
-    # Lưu content_before để gửi lên AI với context đầy đủ (có dòng ads).
     content_before_filter = content
     content = ads_filter.filter_content(content)
 
     removed_chars = len(content_before_filter) - len(content)
     if removed_chars > 0:
         print(f"  [Ads] 🧹 Đã lọc {removed_chars} ký tự ads khỏi nội dung", flush=True)
-    # ─────────────────────────────────────────────────────────────────────────
 
-    # Fingerprint — dùng content đã lọc để hash chính xác
+    # Fingerprint — dùng content đã lọc
     fp           = make_fingerprint(content)
     fingerprints = set(progress.get("fingerprints") or [])
     if fp in fingerprints:
@@ -284,24 +308,16 @@ async def scrape_one_chapter(
     fingerprints.add(fp)
     progress["fingerprints"] = list(fingerprints)
 
-    # FIX-D: truyền ai_limiter để dùng AI khi vote hòa (thay vì max-len fallback)
     title = normalize_title(await title_extractor.extract(soup, url, ai_limiter))
 
-    # Lưu tên truyện
     if progress.get("chapter_count", 0) == 0 and not progress.get("story_title"):
         story_title = extract_story_title(soup, url)
         if story_title:
             progress["story_title"] = story_title
 
-    # Số thứ tự chương tiếp theo (chapter_count chưa tăng lúc này)
     chapter_num = progress.get("chapter_count", 0) + 1
 
     # ── ADS-2: AI scan mỗi ADS_AI_SCAN_EVERY chương ──────────────────────────
-    # Điều kiện: chapter_num % scan_every == 1 → scan chương 1, 6, 11, 16, ...
-    # Lý do dùng == 1 thay vì == 0:
-    #   - chapter_count chưa tăng ở đây nên chapter_num bắt đầu từ 1
-    #   - Scan chương đầu tiên để bắt watermark sớm nhất có thể
-    #   - Với ADS_AI_SCAN_EVERY=5: scan ch.1, 6, 11, 16, ...
     if chapter_num % ADS_AI_SCAN_EVERY == 1:
         context_block = ads_filter.build_ai_context_block(content_before_filter)
         if context_block:
@@ -321,8 +337,6 @@ async def scrape_one_chapter(
                     )
                 else:
                     print(f"  [Ads] ✔ Nội dung sạch, không có pattern mới", flush=True)
-        # context_block là None → không có dòng nghi ngờ → không cần scan
-    # ─────────────────────────────────────────────────────────────────────────
 
     # Ghi file .md
     filename     = f"{chapter_num:04d}_{slugify_filename(title, max_len=60)}.md"
@@ -365,12 +379,9 @@ async def scrape_one_chapter(
     )
 
     # ── Tìm next_url ─────────────────────────────────────────────────────────
-    # FIX-A (tiếp): Nếu ai_classify_cache đã có (từ content extraction),
-    # dùng lại thay vì gọi AI lần 2.
     next_url = find_next_url(soup, url, profile)
     if not next_url:
         if ai_classify_cache is None:
-            # Chỉ gọi khi chưa có cache (tức CSS đã tìm được content)
             ai_classify_cache = await ai_classify_and_find(clean_html, url, ai_limiter)
         if ai_classify_cache:
             next_url = ai_classify_cache.get("next_url")
@@ -391,8 +402,6 @@ async def scrape_one_chapter(
         return None
 
     # ── FIX-B: Cross-domain jump guard ───────────────────────────────────────
-    # Thay thế ask_ai_confirm_same_story gọi mỗi chương (broken + expensive)
-    # bằng kiểm tra domain đơn giản + chỉ gọi AI khi domain thực sự thay đổi.
     current_domain = urlparse(url).netloc
     next_domain    = urlparse(next_url).netloc
 
@@ -442,7 +451,7 @@ async def run_novel_task(
     os.makedirs(output_dir, exist_ok=True)
 
     title_extractor      = TitleExtractor()
-    ads_filter           = SimpleAdsFilter()   # ADS-1: 1 instance per novel task
+    ads_filter           = SimpleAdsFilter()
     consecutive_errors   = 0
     consecutive_timeouts = 0
 
@@ -475,7 +484,7 @@ async def run_novel_task(
                 profiles_lock   = profiles_lock,
                 ai_limiter      = ai_limiter,
                 title_extractor = title_extractor,
-                ads_filter      = ads_filter,   # ADS-1: truyền xuống
+                ads_filter      = ads_filter,
             )
             consecutive_errors   = 0
             consecutive_timeouts = 0
@@ -513,11 +522,6 @@ async def run_novel_task(
 
 # ── Private async helpers ─────────────────────────────────────────────────────
 
-# NOTE: _extract_content_ai đã bị xóa (FIX-C).
-# Logic của nó được inline trực tiếp vào scrape_one_chapter để có thể
-# chia sẻ biến `ai_classify_cache` — tránh gọi AI 2 lần trên cùng payload.
-
-
 async def _advance_past_visited(
     url: str,
     all_visited: set[str],
@@ -536,7 +540,8 @@ async def _advance_past_visited(
 
     soup, clean = await asyncio.to_thread(_sync_parse_and_clean, html)
 
-    profile: SiteProfileDict = profiles.get(urlparse(url).netloc.lower(), {})
+    domain  = urlparse(url).netloc.lower()
+    profile: SiteProfileDict = profiles.get(domain, {})
 
     next_url = find_next_url(soup, url, profile)
     if not next_url:
