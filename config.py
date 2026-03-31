@@ -14,10 +14,10 @@ from urllib.parse import urlparse
 
 from dotenv import load_dotenv
 
-# FIX: Dùng dirname 1 lần (thư mục chứa config.py = thư mục project)
-# Trước đây dùng dirname 2 lần → tìm .env ở grandparent directory (bug)
-_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-load_dotenv(os.path.join(_BASE_DIR, ".env"))
+# Tìm .env từ thư mục project trở lên, tự động
+from pathlib import Path
+load_dotenv(dotenv_path=Path(__file__).parent / ".env")          # thử trong Cào text\
+load_dotenv(dotenv_path=Path(__file__).parent.parent / ".env")   # thử ở Small Project\
 
 GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
 if not GEMINI_API_KEY:
