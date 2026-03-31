@@ -1,10 +1,17 @@
+# core/navigator.py
 """
 core/navigator.py — Phát hiện URL chương tiếp theo và phân loại trang.
 
-Hai hàm công khai:
-  find_next_url()   — heuristic tìm URL chương kế tiếp
-  detect_page_type() — phân loại chapter | index | other
+API thay đổi (breaking change có chủ ý):
+  find_next_url(soup, url, profile)   — nhận BeautifulSoup thay vì str
+  detect_page_type(soup, url)         — nhận BeautifulSoup thay vì str
+
+Lý do: scraper.py đã parse + clean HTML trong asyncio.to_thread() trước khi
+gọi các hàm này. Truyền soup object trực tiếp tránh parse lại lần 2.
+Caller chịu trách nhiệm tạo soup (thường qua _sync_parse_and_clean).
 """
+from __future__ import annotations
+
 import re
 from urllib.parse import urljoin
 
@@ -22,9 +29,15 @@ from config import (
 _RE_FANFIC_CHAPTER = re.compile(r"(/s/\d+/)(\d+)(/.+)?$")
 
 
-def find_next_url(html: str, current_url: str, profile: dict) -> str | None:
+def find_next_url(
+    soup: BeautifulSoup,
+    current_url: str,
+    profile: dict,
+) -> str | None:
     """
     Tìm URL chương tiếp theo bằng heuristic (không gọi AI).
+
+    Nhận BeautifulSoup đã được clean (remove_hidden_elements) từ caller.
 
     Thứ tự ưu tiên:
       1. CSS selector từ site profile (học được trước đó)
@@ -34,7 +47,6 @@ def find_next_url(html: str, current_url: str, profile: dict) -> str | None:
       5. Tăng số chương trong URL slug  (/chapter-12 → /chapter-13)
       6. fanfiction.net pattern  (/s/123/5/ → /s/123/6/)
     """
-    soup = BeautifulSoup(html, "html.parser")
     base = current_url
 
     # 1. Profile selector (độ chính xác cao nhất)
@@ -83,15 +95,15 @@ def find_next_url(html: str, current_url: str, profile: dict) -> str | None:
     return None
 
 
-def detect_page_type(html: str, url: str) -> str:
+def detect_page_type(soup: BeautifulSoup, url: str) -> str:
     """
     Phân loại trang: 'chapter' | 'index' | 'other'.
 
+    Nhận BeautifulSoup từ caller — không parse lại HTML.
     Score-based: cộng điểm cho từng tín hiệu, lấy bên thắng.
     Trả về 'other' khi hòa.
     """
-    soup  = BeautifulSoup(html, "html.parser")
-    score = {"chapter": 0, "index": 0}
+    score: dict[str, int] = {"chapter": 0, "index": 0}
 
     # URL chứa pattern chương → nghiêng về chapter
     if RE_CHAP_URL.search(url):

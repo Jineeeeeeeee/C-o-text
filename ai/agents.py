@@ -1,3 +1,4 @@
+# ai/agents.py
 """
 ai/agents.py — Toàn bộ hàm gọi Gemini API.
 
@@ -6,8 +7,13 @@ Pattern chung:
   2. _parse_json_response()  → parse JSON từ response text
   3. Mỗi agent function chỉ build prompt + gọi helper trên
 
+Tối ưu: BeautifulSoup parsing bên trong agent được đẩy xuống thread pool
+qua asyncio.to_thread() để tránh block Event Loop.
+
 Retry policy: tối đa 3 lần, backoff 30 / 60 / 120 giây khi gặp 429.
 """
+from __future__ import annotations
+
 import asyncio
 import json
 import re
@@ -21,8 +27,8 @@ from ai.client import ai_client, AIRateLimiter
 
 # ── Retry helpers ─────────────────────────────────────────────────────────────
 
-_MAX_RETRIES    = 3
-_RETRY_BACKOFF  = [30, 60, 120]   # giây
+_MAX_RETRIES   = 3
+_RETRY_BACKOFF = [30, 60, 120]  # giây
 
 
 def _is_rate_limit_error(e: Exception) -> bool:
@@ -63,10 +69,8 @@ async def _generate_with_retry(prompt: str, ai_limiter: AIRateLimiter) -> str | 
                 )
                 await asyncio.sleep(wait)
             else:
-                # Lỗi không phải 429, hoặc đã hết retry → raise
                 raise
 
-    # Không bao giờ đến đây, nhưng để type checker vui
     if last_exc:
         raise last_exc
     return None
@@ -83,6 +87,41 @@ def _parse_json_response(text: str) -> dict | list | None:
         return None
 
 
+# ── Sync HTML helpers (chạy trong thread pool) ────────────────────────────────
+
+def _sync_get_profile_snippet(html: str) -> str:
+    """Lấy HTML snippet (8KB) để build profile — CPU-bound."""
+    soup = BeautifulSoup(html, "html.parser")
+    return str(soup)[:8000]
+
+
+def _sync_get_chapter_links(html: str, base_url: str) -> list[str]:
+    """Tìm tất cả link có pattern chương trong HTML — CPU-bound."""
+    soup = BeautifulSoup(html, "html.parser")
+    return [
+        urljoin(base_url, a["href"])
+        for a in soup.find_all("a", href=True)
+        if RE_CHAP_HINT.search(a["href"])
+    ]
+
+
+def _sync_get_nav_hints_and_snippet(html: str, base_url: str) -> tuple[str, str]:
+    """
+    Tìm nav hints (Next/Prev links) và HTML snippet cho ai_classify_and_find.
+    CPU-bound — chạy qua asyncio.to_thread().
+    Trả về (hint_block, snippet).
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    nav_hints = [
+        f"{a.get_text(strip=True)!r} → {urljoin(base_url, a['href'])}"
+        for a in soup.find_all("a", href=True)
+        if RE_NEXT_PREV.search(a.get_text(strip=True))
+    ]
+    hint_block = "\n".join(nav_hints[:10]) if nav_hints else "(không có)"
+    snippet    = str(soup)[:6000]
+    return hint_block, snippet
+
+
 # ── Agent functions ───────────────────────────────────────────────────────────
 
 async def ask_ai_build_profile(
@@ -91,8 +130,8 @@ async def ask_ai_build_profile(
     ai_limiter: AIRateLimiter,
 ) -> dict | None:
     """Phân tích HTML để xây dựng CSS selector profile cho site mới."""
-    soup    = BeautifulSoup(html, "html.parser")
-    snippet = str(soup)[:8000]
+    # CPU-bound: parse + slice HTML trong thread pool
+    snippet = await asyncio.to_thread(_sync_get_profile_snippet, html)
 
     prompt = f"""Phân tích HTML trang chương truyện sau và trả về JSON.
 URL: {url}
@@ -191,12 +230,8 @@ async def ai_find_first_chapter_url(
     ai_limiter: AIRateLimiter,
 ) -> str | None:
     """Tìm URL chương đầu tiên từ trang mục lục / trang truyện."""
-    soup  = BeautifulSoup(html, "html.parser")
-    links = [
-        urljoin(base_url, a["href"])
-        for a in soup.find_all("a", href=True)
-        if RE_CHAP_HINT.search(a["href"])
-    ]
+    # CPU-bound: parse + filter links trong thread pool
+    links = await asyncio.to_thread(_sync_get_chapter_links, html, base_url)
 
     if not links:
         return None
@@ -220,7 +255,7 @@ Trả về JSON (CHỈ JSON):
     except Exception as e:
         print(f"  [AI] ⚠ ai_find_first_chapter_url thất bại: {e}", flush=True)
 
-    return links[0]   # Fallback: chương đầu tiên trong danh sách
+    return links[0]  # Fallback: link đầu tiên
 
 
 async def ai_classify_and_find(
@@ -234,15 +269,10 @@ async def ai_classify_and_find(
     Trả về: page_type (chapter|index|other), next_url, first_chapter_url.
     Nhận html đã được làm sạch (remove_hidden_elements) từ scraper.
     """
-    soup = BeautifulSoup(html, "html.parser")
-
-    nav_hints = [
-        f"{a.get_text(strip=True)!r} → {urljoin(base_url, a['href'])}"
-        for a in soup.find_all("a", href=True)
-        if RE_NEXT_PREV.search(a.get_text(strip=True))
-    ]
-    hint_block = "\n".join(nav_hints[:10]) if nav_hints else "(không có)"
-    snippet    = str(soup)[:6000]
+    # CPU-bound: parse + extract hints trong thread pool
+    hint_block, snippet = await asyncio.to_thread(
+        _sync_get_nav_hints_and_snippet, html, base_url
+    )
 
     prompt = f"""Phân loại trang web và tìm URL chương tiếp theo.
 

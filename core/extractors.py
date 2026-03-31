@@ -1,10 +1,15 @@
+# core/extractors.py
 """
 core/extractors.py — Trích xuất tiêu đề chương và tên truyện.
 
-Hai thứ công khai:
-  TitleExtractor        — trích tiêu đề một chương (từ HTML)
-  extract_story_title() — trích tên truyện (từ breadcrumb / <title>)
+API thay đổi:
+  TitleExtractor.extract(soup, url)   — nhận BeautifulSoup thay vì str
+  extract_story_title(soup, url)      — không đổi (đã nhận soup)
+
+Caller (scraper.py) đã có soup từ _sync_parse_and_clean → không parse lại.
 """
+from __future__ import annotations
+
 import re
 from collections import Counter
 from urllib.parse import urlparse, unquote
@@ -25,15 +30,20 @@ _RE_CHAP_SUFFIX = re.compile(r"\s+chapter\s+\d+.*$", re.IGNORECASE)
 
 class TitleExtractor:
     """
-    Trích xuất tiêu đề chương từ HTML bằng đa-nguồn + voting.
+    Trích xuất tiêu đề chương từ BeautifulSoup bằng đa-nguồn + voting.
 
-    Không cần state → có thể dùng như singleton (khởi tạo 1 lần).
-    Tham số ai_limiter đã được XÓA (từng dùng ai_validate_title,
-    hiện không cần thiết vì tie-breaking dựa vào độ dài).
+    Không cần state → có thể dùng như singleton.
+    Không nhận `html: str` nữa — caller truyền soup đã parse để tránh
+    parse lại lần thứ N trong cùng một chapter pipeline.
     """
 
-    async def extract(self, html: str, url: str) -> str:
-        soup       = BeautifulSoup(html, "html.parser")
+    async def extract(self, soup: BeautifulSoup, url: str) -> str:
+        """
+        Trích tiêu đề từ soup đã parse sẵn.
+
+        Async để giữ interface nhất quán (có thể thêm AI fallback sau),
+        nhưng bản thân hàm không block — chỉ dùng CPU nhẹ.
+        """
         candidates = self._collect_candidates(soup, url)
 
         cleaned: list[str] = []
@@ -68,10 +78,10 @@ class TitleExtractor:
         result: list[str] = []
 
         for tag_name, attr in [
-            ("title",  None),
-            ("meta",   "og:title"),
-            ("h1",     None),
-            ("h2",     None),
+            ("title", None),
+            ("meta",  "og:title"),
+            ("h1",    None),
+            ("h2",    None),
         ]:
             if attr:
                 el = soup.find(tag_name, property=attr)
@@ -126,14 +136,11 @@ class TitleExtractor:
 
 def extract_story_title(soup: BeautifulSoup, url: str) -> str | None:
     """
-    Trích tên truyện (không phải tiêu đề chương) từ HTML.
+    Trích tên truyện (không phải tiêu đề chương) từ BeautifulSoup.
 
     Nguồn theo thứ tự ưu tiên:
       1. Breadcrumb — phần tử áp chót thường là tên truyện
       2. <title> dạng "Story Name Chapter N | SiteName"
-         → lấy phần trước |, xóa fandom tag và chapter suffix
-
-    Trả về None nếu không tìm được.
     """
     # 1. Breadcrumb
     for bc in soup.find_all(attrs={"class": re.compile(r"breadcrumb", re.I)}):
@@ -149,8 +156,8 @@ def extract_story_title(soup: BeautifulSoup, url: str) -> str | None:
         raw = title_tag.get_text(strip=True)
         if "|" in raw:
             before_pipe = raw.split("|")[0].strip()
-            before_pipe = _RE_FANDOM_TAG.sub("",   before_pipe).strip()
-            before_pipe = _RE_CHAP_SUFFIX.sub("",  before_pipe).strip()
+            before_pipe = _RE_FANDOM_TAG.sub("",  before_pipe).strip()
+            before_pipe = _RE_CHAP_SUFFIX.sub("", before_pipe).strip()
             if len(before_pipe) > 3:
                 return normalize_title(before_pipe)
 
