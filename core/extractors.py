@@ -3,8 +3,11 @@
 core/extractors.py — Trích xuất tiêu đề chương và tên truyện.
 
 API thay đổi:
-  TitleExtractor.extract(soup, url)   — nhận BeautifulSoup thay vì str
-  extract_story_title(soup, url)      — không đổi (đã nhận soup)
+  TitleExtractor.extract(soup, url, ai_limiter?)  — nhận BeautifulSoup thay vì str
+  extract_story_title(soup, url)                  — không đổi (đã nhận soup)
+
+FIX-D: Wire `ai_validate_title` khi majority vote hòa (thay vì max(len)).
+       ai_limiter là optional — nếu None thì fallback về hành vi cũ (max len).
 
 Caller (scraper.py) đã có soup từ _sync_parse_and_clean → không parse lại.
 """
@@ -12,11 +15,15 @@ from __future__ import annotations
 
 import re
 from collections import Counter
+from typing import TYPE_CHECKING
 from urllib.parse import urlparse, unquote
 
 from bs4 import BeautifulSoup
 
 from utils.string_helpers import normalize_title
+
+if TYPE_CHECKING:
+    from ai.client import AIRateLimiter
 
 _MIN_TITLE_LEN = 3
 
@@ -35,14 +42,24 @@ class TitleExtractor:
     Không cần state → có thể dùng như singleton.
     Không nhận `html: str` nữa — caller truyền soup đã parse để tránh
     parse lại lần thứ N trong cùng một chapter pipeline.
+
+    FIX-D: Khi vote hòa, gọi ai_validate_title thay vì chọn theo max(len).
+           ai_limiter là optional để không phá interface cũ.
     """
 
-    async def extract(self, soup: BeautifulSoup, url: str) -> str:
+    async def extract(
+        self,
+        soup: BeautifulSoup,
+        url: str,
+        ai_limiter: "AIRateLimiter | None" = None,
+    ) -> str:
         """
         Trích tiêu đề từ soup đã parse sẵn.
 
-        Async để giữ interface nhất quán (có thể thêm AI fallback sau),
-        nhưng bản thân hàm không block — chỉ dùng CPU nhẹ.
+        Args:
+            soup:       BeautifulSoup của trang chương (đã clean).
+            url:        URL hiện tại — dùng làm fallback slug.
+            ai_limiter: Nếu cung cấp, gọi AI khi vote hòa thay vì chọn max(len).
         """
         candidates = self._collect_candidates(soup, url)
 
@@ -67,12 +84,33 @@ class TitleExtractor:
         counts = Counter(t.lower() for t in cleaned)
         top2   = counts.most_common(2)
 
-        # Khi hòa → chọn title dài nhất (thường đầy đủ hơn)
-        if len(top2) > 1 and top2[0][1] == top2[1][1]:
-            tied = [lower_map[t[0]] for t in top2]
-            return max(tied, key=len)
+        # Không hòa → trả về ngay
+        if len(top2) == 1 or top2[0][1] != top2[1][1]:
+            return lower_map[top2[0][0]]
 
-        return lower_map[top2[0][0]]
+        # ── Vote hòa ──────────────────────────────────────────────────────────
+        tied = [lower_map[t[0]] for t in top2]
+
+        # FIX-D: Dùng AI validate khi có ai_limiter
+        if ai_limiter is not None:
+            from ai.agents import ai_validate_title
+            # Lấy snippet đầu trang để AI có context
+            body_el = soup.find("body")
+            snippet = body_el.get_text(separator=" ", strip=True)[:300] if body_el else ""
+
+            # Thử validate candidate ngắn hơn trước (thường là tiêu đề thật)
+            primary = min(tied, key=len)
+            validated = await ai_validate_title(
+                candidate       = primary,
+                chapter_url     = url,
+                content_snippet = snippet,
+                ai_limiter      = ai_limiter,
+            )
+            if validated:
+                return normalize_title(validated)
+
+        # Fallback: chọn title dài nhất (hành vi cũ)
+        return max(tied, key=len)
 
     def _collect_candidates(self, soup: BeautifulSoup, url: str) -> list[str]:
         result: list[str] = []
