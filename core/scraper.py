@@ -40,7 +40,7 @@ import logging
 import os
 import re
 from urllib.parse import urlparse
-from utils.ads_filter import SimpleAdsFilter, _ADS_DB_FILE
+from utils.ads_filter import SimpleAdsFilter
 from bs4 import BeautifulSoup
 
 from config import (
@@ -503,7 +503,7 @@ async def scrape_one_chapter(
     content = ads_filter.filter_content(content)
 
     removed_chars = len(content_before_filter) - len(content)
-    if removed_chars > 0:
+    if removed_chars > 0:                      # ← 4 spaces indent, inside function
         after_set     = set(content.splitlines())
         removed_lines = [
             l.strip() for l in content_before_filter.splitlines()
