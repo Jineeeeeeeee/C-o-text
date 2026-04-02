@@ -1,86 +1,52 @@
 # Cào Text
 
-Công cụ cào nội dung truyện từ các trang web novel (RoyalRoad, ScribbleHub, Wattpad, v.v.)
-và lưu từng chương thành file `.md`. Hỗ trợ resume, lọc watermark bằng AI, và chống
-Cloudflare tự động.
+Công cụ cào truyện từ web novel sites (RoyalRoad, ScribbleHub, Wattpad, fanfiction.net, ...).
+Lưu từng chương thành file `.md` với formatting hoàn chỉnh — bảng, in đậm/nghiêng,
+system box (LitRPG), spoiler text, author's note, công thức toán.
 
 ---
 
-## Mục lục
+## Tính năng nổi bật
 
-- [Yêu cầu](#yêu-cầu)
-- [Cài đặt](#cài-đặt)
-- [Cấu hình](#cấu-hình)
-- [Cách dùng](#cách-dùng)
-- [Cấu trúc dự án](#cấu-trúc-dự-án)
-- [Pipeline hoạt động](#pipeline-hoạt-động)
-- [Các tính năng chính](#các-tính-năng-chính)
-- [Bugs đã sửa](#bugs-đã-sửa)
-- [Lưu ý & giới hạn](#lưu-ý--giới-hạn)
+| Tính năng | Mô tả |
+|---|---|
+| **Thorough Learning Mode** | Lần đầu scrape một domain: 5 AI calls học toàn bộ cấu trúc site |
+| **Full Scrape Mode** | Lần sau: tốc độ cao, không AI, format chuẩn từ profile đã học |
+| **MarkdownFormatter** | Tables, system box, spoiler, author note, math, bold/italic, HR |
+| **CF bypass** | curl_cffi (Chrome TLS fingerprint) + Playwright fallback tự động |
+| **Resume an toàn** | Atomic JSON + fingerprint dedup, resume sau Ctrl+C |
+| **Ads filter** | Keyword + regex lọc watermark, học từ profile |
 
 ---
 
 ## Yêu cầu
 
 - Python 3.11+
-- Gemini API key (free tier đủ dùng — 15 RPM, config mặc định dùng 3 RPM)
+- Gemini API key (free tier: 15 RPM — config mặc định dùng 10 RPM)
 
 ---
 
 ## Cài đặt
 
 ```bash
-# 1. Clone hoặc giải nén project
+# 1. Vào thư mục project
 cd "Cào Text"
 
-# 2. Tạo virtual environment (khuyến nghị)
+# 2. Virtual environment (khuyến nghị)
 python -m venv .venv
-source .venv/bin/activate   # Linux/macOS
-.venv\Scripts\activate      # Windows
+.venv\Scripts\activate       # Windows
+source .venv/bin/activate    # Linux/macOS
 
-# 3. Cài dependencies
+# 3. Dependencies
 pip install curl_cffi beautifulsoup4 google-genai python-dotenv
 
-# 4. (Tuỳ chọn) Cài Playwright để bypass Cloudflare
+# 4. Playwright (chỉ cần nếu site dùng Cloudflare)
 pip install playwright playwright-stealth
 playwright install chromium
 
-# 5. Tạo file .env ở thư mục cha (cùng cấp với folder "Cào Text")
-echo "GEMINI_API_KEY=your_api_key_here" > ../.env
-# Hoặc đặt thêm model (mặc định: gemini-2.0-flash):
-echo "GEMINI_MODEL=gemini-2.0-flash" >> ../.env
+# 5. API key
+echo "GEMINI_API_KEY=your_key_here" > .env
 ```
-
----
-
-## Cấu hình
-
-### `.env`
-
-```env
-GEMINI_API_KEY=your_api_key_here
-GEMINI_MODEL=gemini-2.0-flash        # tuỳ chọn
-```
-
-### `links.txt`
-
-Mỗi dòng một URL — có thể là trang chương hoặc trang mục lục (index):
-
-```
-# Dòng bắt đầu bằng # bị bỏ qua
-https://www.royalroad.com/fiction/55418/the-wandering-inn
-https://www.scribblehub.com/series/123456/my-novel/
-https://www.royalroad.com/fiction/99999/chapter-1
-```
-
-### `config.py` — các tham số quan trọng
-
-| Tham số | Mặc định | Ý nghĩa |
-|---|---|---|
-| `MAX_CHAPTERS` | 1000 | Giới hạn số chương mỗi truyện |
-| `AI_MAX_RPM` | 3 | Số lần gọi Gemini tối đa / phút |
-| `STORY_ID_LEARN_AFTER` | 12 | Sau bao nhiêu chương thì AI học story ID |
-| `DELAY_PROFILES` | xem file | Delay giữa chương theo domain |
 
 ---
 
@@ -90,184 +56,197 @@ https://www.royalroad.com/fiction/99999/chapter-1
 # Chạy với links.txt mặc định
 python main.py
 
-# Hoặc chỉ định file links khác
+# Hoặc chỉ định file khác
 python main.py my_links.txt
 ```
 
-Output được lưu trong `output/<domain>_<slug>/`:
+**`links.txt`** — mỗi dòng một URL (chapter hoặc index đều được):
+```
+# Dòng bắt đầu bằng # bị bỏ qua
+https://www.royalroad.com/fiction/55418/the-wandering-inn
+https://www.scribblehub.com/series/123456/my-novel/
+https://www.fanfiction.net/s/12345678/1/My-Story
+```
+
+**Output:**
 ```
 output/
   royalroad_com_fiction_55418/
-    0001_Chapter One - The Beginning.md
-    0002_Chapter Two - Into the Dark.md
+    0001_Prologue.md
+    0002_Chapter 1 - The Beginning.md
     ...
 ```
 
-File progress được lưu ở thư mục gốc:
-```
-progress_www_royalroad_com_royalroad_com_fiction_55418_<hash>.json
-```
-
-**Resume tự động:** Nếu chương trình bị ngắt, chạy lại cùng lệnh — sẽ tiếp tục
-từ chương chưa xong, không cào lại từ đầu.
-
 ---
 
-## Cấu trúc dự án
-
-```
-Cào Text/
-├── main.py                  # Entry point, AppState, task scheduler
-├── config.py                # Hằng số, regex compile, delay profiles
-├── links.txt                # Danh sách URL cần cào
-├── ADs_keyword.json         # DB keyword/regex lọc watermark (tự cập nhật)
-├── .env                     # (không commit) API key
-│
-├── core/
-│   ├── scraper.py           # Logic cào chính: fetch → parse → lưu → next
-│   ├── extractors.py        # TitleExtractor: 8 nguồn + majority vote
-│   └── session_pool.py      # DomainSessionPool (curl_cffi) + PlaywrightPool
-│
-├── ai/
-│   ├── client.py            # Gemini client + AIRateLimiter (token bucket)
-│   └── agents.py            # Tất cả hàm gọi Gemini API
-│
-└── utils/
-    ├── ads_filter.py        # AdsFilter: lọc watermark, học pattern qua AI
-    ├── file_io.py           # Atomic I/O cho progress JSON và file .md
-    └── string_helpers.py    # Fingerprint, clean text, CF detection
-```
-
----
-
-## Pipeline hoạt động
+## Pipeline
 
 ```
 links.txt
     │
     ▼
-[Startup] Khởi tạo AIRateLimiter, DomainSessionPool, PlaywrightPool, AdsFilter
+[Khởi động] Load profiles, khởi tạo pools
     │
-    ▼ (mỗi URL, chạy song song với asyncio.gather)
-[Tìm chương bắt đầu]
-    ├─ Resume từ progress JSON nếu có
-    └─ Nếu không: fetch trang → detect_page_type → AI tìm ch.1 nếu là index
-    │
-    ▼ ──────────────────── vòng lặp per-chapter ────────────────────────
-[Domain delay]  (2–45s ngẫu nhiên theo DELAY_PROFILES)
+    ▼ (mỗi URL chạy song song)
+[Domain mới hoặc profile cũ > 30 ngày?]
+    ├─ YES → Thorough Learning Mode (5 AI calls)
+    │         └─ Save profile → Reset progress → Phase 3
+    └─ NO  → Load profile → Phase 3
     │
     ▼
-[Fetch HTML]
-    ├─ curl_cffi (Chrome TLS fingerprint)
-    └─ Playwright headless nếu gặp Cloudflare challenge
-    │
-    ▼
-[Xây profile domain nếu mới]  ← AI: ask_ai_build_profile  (FIX #3)
-    │
-    ▼
-[Remove hidden elements]  (strip CSS watermark, aria-hidden)
-    │
-    ▼
-[Trích xuất nội dung]
-    ├─ CSS selectors (9 selector ưu tiên)
-    └─ AI fallback: ai_classify_and_find
-    │
-    ▼
-[Lọc ads] ← AdsKeywordDB.is_match (keyword + regex)
-    │
-    ▼
-[Fingerprint check]  MD5 → set lookup O(1)  (FIX #5)
-    │
-    ▼
-[Trích tiêu đề]  8 nguồn → majority vote → AI nếu hòa
-    │
-    ▼
-[Lưu file .md]  atomic write
-    │
-    ▼
-[AdsFilter học pattern mới]  mỗi 10 chương → AI scan
-    │
-    ▼
-[Story ID guard]  AI học regex sau 12 chương
-    │
-    ▼
-[Tìm URL tiếp theo]  ← clean_html (FIX #2)
-    ├─ CSS selector profile
-    ├─ rel=next
-    ├─ slug +1
-    └─ AI fallback
-    │
-    ▼
-[Xác nhận cùng truyện]  ← AI: ask_ai_confirm_same_story  (FIX #4)
-    │
-    ▼
-[Lưu next_url vào progress]  (FIX #1)  ← QUAN TRỌNG: lưu URL tiếp theo, không phải URL vừa xong
-    │
-    └─ lặp lại ────────────────────────────────────────────────────────
-    │
-    ▼
-[Flush AdsFilter + đóng pool + in tổng kết]
+[Phase 3: Full Scrape Mode]
+    ├─ Delay (lịch sự theo domain)
+    ├─ Fetch HTML (curl_cffi → Playwright nếu CF)
+    ├─ Clean HTML (remove hidden, remove_selectors từ profile)
+    ├─ Extract content (content_selector từ profile)
+    ├─ Format → Markdown (MarkdownFormatter + FormattingRules)
+    ├─ Ads filter (keywords + regex từ profile)
+    ├─ Fingerprint dedup
+    ├─ Save .md (atomic write)
+    └─ Find next URL → lặp lại
 ```
 
 ---
 
-## Các tính năng chính
+## Thorough Learning Mode (chi tiết)
 
-### Chống Cloudflare tự động
-Mặc định dùng `curl_cffi` với TLS fingerprint Chrome. Khi gặp CF challenge,
-tự động fallback sang Playwright headless và chờ tối đa 20 giây để CF tự giải.
-Playwright được giữ sống suốt phiên (không launch lại mỗi lần) — chỉ mở page
-mới (~50ms) thay vì cả browser (~2s).
+Chỉ chạy **1 lần** khi domain chưa có profile (hoặc profile > 30 ngày).
+Tốn ~2–3 phút, ~5 Gemini calls.
 
-### Resume an toàn
-Progress được lưu dưới dạng JSON với atomic write (`.tmp` + `os.replace()`).
-Tên file progress bao gồm hash URL 8 ký tự để tránh collision giữa các URL
-cùng domain (VD: trang index và trang chapter đầu của cùng truyện).
+```
+Ch.1 (Playwright) → AI #1: Build initial profile
+                          └─ content_selector, next_selector, nav_type, ...
+Ch.2 (curl_cffi)  → AI #2: Validate — selectors có hoạt động không?
+Ch.3 (curl_cffi)  → AI #3: Detect tables / math / special symbols
+Ch.4 (curl_cffi)  → AI #4: Detect system box / spoiler / author note
+Ch.5 (curl_cffi)  → AI #5: Final cross-check + confidence score
 
-### AI-powered (Gemini)
-Tất cả AI call đều có rate limiting (token bucket) và jitter để không vượt
-quota free tier. Các tình huống AI được gọi:
+→ Merge → SiteProfile (lưu vào data/site_profiles.json)
+→ Reset progress → Scrape lại từ Ch.1 với profile hoàn chỉnh
+```
 
-| Tình huống | Hàm AI |
+### Tại sao Ch.1 dùng Playwright?
+Một số site dùng JS để render content (lazy load, React, v.v.).
+Playwright đảm bảo HTML đầy đủ cho AI #1 phân tích — chi phí nhỏ, chỉ 1 lần.
+
+---
+
+## Formatting rules (site_profiles.json)
+
+Sau khi học, profile lưu `formatting_rules` ví dụ:
+
+```json
+{
+  "domain": "www.royalroad.com",
+  "confidence": 0.96,
+  "content_selector": "div.chapter-content",
+  "next_selector": "a.btn-primary[rel='next']",
+  "formatting_rules": {
+    "tables": true,
+    "bold_italic": true,
+    "hr_dividers": true,
+    "math_support": false,
+    "system_box": {
+      "found": true,
+      "selectors": [".well", ".panel-body"],
+      "convert_to": "blockquote",
+      "prefix": "**System:**"
+    },
+    "hidden_text": {
+      "found": false
+    },
+    "author_note": {
+      "found": true,
+      "selectors": [".author-note"],
+      "convert_to": "blockquote_note"
+    }
+  }
+}
+```
+
+### Các `convert_to` được hỗ trợ
+
+| Element | convert_to | Output |
+|---|---|---|
+| system_box | `blockquote` | `> **System:** ...` |
+| system_box | `code_block` | ` ```\n...\n``` ` |
+| hidden_text | `spoiler_tag` | `\|\|text\|\|` |
+| hidden_text | `strikethrough` | `~~text~~` |
+| hidden_text | `skip` | *(bỏ qua)* |
+| author_note | `blockquote_note` | `> *Author's Note:* ...` |
+| author_note | `italic_note` | `*[AN: ...]*` |
+| author_note | `skip` | *(bỏ qua)* |
+
+---
+
+## Cấu hình (`config.py`)
+
+| Tham số | Mặc định | Ý nghĩa |
+|---|---|---|
+| `MAX_CHAPTERS` | 5000 | Giới hạn chương/truyện |
+| `AI_MAX_RPM` | 10 | Gemini calls/phút (free: 15) |
+| `LEARNING_CHAPTERS` | 5 | Chapters dùng để học |
+| `PROFILE_MAX_AGE_DAYS` | 30 | Re-learn nếu profile cũ hơn |
+
+**Delay theo domain** (trong `_DELAY_PROFILES`):
+
+| Domain | Delay |
 |---|---|
-| Domain mới, chưa có CSS profile | `ask_ai_build_profile` |
-| Trang index, tìm chương đầu | `ai_find_first_chapter_url` |
-| Không tìm được next URL | `ai_classify_and_find` |
-| Nội dung rỗng | `ai_classify_and_find` |
-| Vote tiêu đề hòa nhau | `ai_validate_title` |
-| Học story ID (sau 12 chương) | `ask_ai_for_story_id` |
-| Xác nhận next URL cùng truyện | `ask_ai_confirm_same_story` |
-| Scan watermark mới (mỗi 10 ch) | `ai_detect_ads_content` |
-
-### Lọc watermark / ads
-`AdsKeywordDB` chứa keyword và regex phát hiện watermark nhúng bởi aggregator
-site (VD: "stolen content", "read at royalroad"). Danh sách seed được nạp khi
-khởi động; AI tự học pattern mới từ nội dung thực tế mỗi 10 chương.
+| royalroad.com | 6–14s |
+| scribblehub.com | 4–10s |
+| wattpad.com | 3–8s |
+| fanfiction.net | 2–6s |
+| archiveofourown.org | 2–5s |
+| *Khác* | 1–3s |
 
 ---
 
-## Bugs đã sửa
+## Cấu trúc project
 
-| # | File | Mô tả | Mức độ |
-|---|---|---|---|
-| **#1** | `core/scraper.py` | `progress["current_url"]` lưu `url` thay vì `next_url` → resume bị thoát ngay | 🔴 Critical |
-| **#2** | `core/scraper.py` | `find_next_url_heuristic` nhận `html` thô thay vì `clean_html` → có thể chọn nhầm hidden link | 🟠 High |
-| **#3** | `core/scraper.py` | `ask_ai_build_profile` + `save_new_profile` định nghĩa nhưng không gọi → domain lạ không học được selector | 🟠 High |
-| **#4** | `core/scraper.py` | `ask_ai_confirm_same_story` định nghĩa nhưng không gọi → không phát hiện khi nhảy sang truyện khác | 🟠 High |
-| **#5** | `core/scraper.py` | `fingerprints` dùng `list` + cắt 50 → O(n) lookup, bỏ sót loop sau ch.50 | 🟢 Medium |
-| **#6** | `main.py` | `_make_progress_path` collision khi URL index và URL chapter cùng truyện | 🟢 Medium |
-| **#7** | `main.py` | `AI_MAX_RPM` import từ `ai.client` thay vì `config` (nguồn gốc) | ⚪ Low |
+```
+cao_text/
+├── main.py                  # Entry point, AppState
+├── config.py                # Hằng số, regex, delays
+├── links.txt                # URLs cần cào
+│
+├── data/                    # Runtime data (git ignored)
+│   ├── site_profiles.json   # Profiles đã học per-domain
+│   └── ads_keywords.json    # Ads/watermark DB
+│
+├── output/                  # Chapters .md (git ignored)
+├── progress/                # Progress JSON (git ignored)
+│
+├── ai/
+│   ├── client.py            # Gemini client + rate limiter
+│   ├── prompts.py           # 5 Learning + 2 Utility prompts
+│   └── agents.py            # 7 agent functions
+│
+├── core/
+│   ├── fetch.py             # CF fallback tự động
+│   ├── session_pool.py      # curl_cffi + Playwright pools
+│   ├── html_filter.py       # Hidden/noise/remove_selectors
+│   ├── formatter.py         # MarkdownFormatter (driven by profile)
+│   ├── extractor.py         # Content + title extraction
+│   ├── navigator.py         # Next URL heuristics
+│   └── scraper.py           # Full Scrape Mode loop
+│
+├── learning/
+│   ├── profile_manager.py   # Thread-safe profile storage
+│   └── phase.py             # Thorough Learning Mode (5 AI calls)
+│
+└── utils/
+    ├── types.py             # TypedDicts (SiteProfile, FormattingRules, ...)
+    ├── string_helpers.py    # normalize_title, make_fingerprint, ...
+    ├── file_io.py           # Async-safe I/O
+    └── ads_filter.py        # Keyword + regex watermark filter
+```
 
 ---
 
-## Lưu ý & giới hạn
+## Lưu ý
 
-- **Chỉ dùng cho mục đích cá nhân.** Luôn kiểm tra ToS của trang web trước khi cào.
-- **RoyalRoad** và một số site có rate limit nghiêm → delay mặc định 15–45s.
-  Giảm delay có thể bị IP ban.
-- **Playwright** cần cài riêng (`playwright install chromium`) và chỉ khởi động
-  khi thực sự gặp Cloudflare — không tốn tài nguyên nếu không cần.
-- **Gemini free tier** cho phép 15 RPM. Config mặc định dùng 3 RPM để an toàn
-  khi chạy nhiều truyện song song. Tăng `AI_MAX_RPM` nếu dùng paid tier.
-- File `ADs_keyword.json` tự cập nhật theo thời gian — có thể commit để chia sẻ
-  với người dùng khác.
+- **Chỉ dùng cho mục đích cá nhân.** Kiểm tra ToS của site trước khi cào.
+- **RoyalRoad / ScribbleHub** có rate limit nghiêm — không giảm delay.
+- **Playwright** chỉ khởi động khi gặp Cloudflare, không tốn tài nguyên bình thường.
+- **`data/site_profiles.json`** có thể commit để chia sẻ profiles giữa máy.
+- **Gemini free tier**: 15 RPM. Config mặc định 10 RPM để an toàn khi chạy song song.

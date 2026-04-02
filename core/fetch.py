@@ -1,8 +1,14 @@
 """
 core/fetch.py — fetch_page với Cloudflare fallback tự động.
 
-Tách khỏi scraper.py để dễ test và thay thế transport layer.
+Flow:
+  1. Domain đã biết cần PW → dùng thẳng Playwright
+  2. curl_cffi (nhanh, ít overhead)
+  3. Gặp CF challenge → đánh dấu domain, retry Playwright
+  4. Vẫn bị CF → raise RuntimeError
 """
+from __future__ import annotations
+
 from urllib.parse import urlparse
 
 from utils.string_helpers import is_cloudflare_challenge
@@ -14,18 +20,9 @@ async def fetch_page(
     pool: DomainSessionPool,
     pw_pool: PlaywrightPool,
 ) -> tuple[int, str]:
-    """
-    Fetch trang với tự động fallback Playwright khi gặp Cloudflare challenge.
-
-    Flow:
-      1. Domain đã biết cần PW → dùng thẳng Playwright
-      2. curl_cffi trước (nhanh, ít overhead)
-      3. Nếu CF challenge → đánh dấu domain, retry bằng Playwright
-      4. Nếu Playwright vẫn bị CF → raise RuntimeError
-    """
     domain = urlparse(url).netloc.lower()
 
-    # Shortcut: domain đã bị đánh dấu CF từ lần trước
+    # Shortcut nếu domain đã được đánh dấu CF
     if pool.is_cf_domain(domain):
         return await pw_pool.fetch(url)
 
@@ -33,12 +30,11 @@ async def fetch_page(
     if not is_cloudflare_challenge(html):
         return status, html
 
-    # Lần đầu gặp CF challenge
-    print(f"  [CF] {domain} → chuyển sang Playwright cho toàn bộ phiên", flush=True)
+    print(f"  [CF] {domain} → Playwright mode", flush=True)
     pool.mark_cf_domain(domain)
     status, html = await pw_pool.fetch(url)
 
     if is_cloudflare_challenge(html):
-        raise RuntimeError(f"CF challenge không được giải: {url}")
+        raise RuntimeError(f"CF challenge không được giải quyết: {url}")
 
     return status, html

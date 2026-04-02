@@ -1,14 +1,10 @@
-# utils/ads_filter.py
 """
-utils/ads_filter.py — Filter watermark/ads từ nội dung chương truyện.
+utils/ads_filter.py — Lọc watermark/ads từ nội dung chương truyện.
 
-CHANGES (v4):
-  _SEED_PATTERNS_RAW: Thêm patterns bắt script tags và JS ad code xuất hiện
-    dưới dạng text trong nội dung (novelfire.net và các aggregator tương tự
-    inject pubfuturetag, googletag, adsbygoogle trực tiếp vào article body).
-
-  inject_domain_keywords(): Nhận domain_watermarks từ SiteProfileDict.
-  inject_domain_patterns(): Nhận regex patterns từ profile.
+Simplified từ phiên bản cũ:
+  - Không còn build_ai_context_block (AI scan được tích hợp vào Learning Phase)
+  - Inject keywords từ profile khi khởi động
+  - Có thể add keywords mới trong runtime
 """
 from __future__ import annotations
 
@@ -16,137 +12,117 @@ import json
 import logging
 import os
 import re
+from typing import TYPE_CHECKING
+
+from config import ADS_DB_FILE
+
+if TYPE_CHECKING:
+    from utils.types import SiteProfile
 
 logger = logging.getLogger(__name__)
 
-ADS_DB_FILE = "ADs_keyword.json"
+_MIN_LINE_LEN = 15
 
 _SEED_KEYWORDS: list[str] = [
     "stolen content", "stolen from", "this content is stolen",
-    "this chapter is stolen", "this chapter was stolen",
-    "this work has been stolen", "if you come across this story",
-    "if you find this content", "this story has been stolen",
-    "has been taken without permission", "taken without permission",
+    "this chapter is stolen", "has been taken without permission",
     "read at royalroad", "read on royalroad", "read the original at",
-    "read the original on", "original source",
-    "find this and other great novels", "check out the original",
-    "visit the original", "please support the author",
-    "support the original", "support the original author",
-    "for more, visit", "more chapters at", "read more at",
-    "patreon.com/", "ko-fi.com/", "buymeacoffee.com/",
+    "find this and other great novels", "please support the author",
+    "support the original", "patreon.com/", "ko-fi.com/",
     "read at scribblehub", "read on scribblehub",
     "original at webnovel", "read on webnovel",
-    "read on wattpad", "find this story on wattpad",
-    "if you encounter this story on amazon",
-    "encounter this story on amazon", "found on amazon, report it",
-    "share to your friends", "share this chapter", "share this novel",
     "keyboard keys to browse between chapters",
-    "use left, right keyboard keys", "you can use left, right",
-    "left, right keyboard keys to browse",
-    "if you find any errors", "non-standard content, ads redirect",
-    "please let us know so we can fix", "let us know so we can fix it",
-    "translate by", "translation by", "translated by system",
-    "mtl by", "machine translated by", "raw source:",
-    "chapters are updated daily", "visit lightnovelreader",
-    "visit novelfull", "visit wuxiaworld", "visit gravitytales",
+    "use left, right keyboard keys",
+    "if you find any errors", "translate by", "translation by",
+    "mtl by", "machine translated", "chapters are updated daily",
+    "visit lightnovelreader", "visit novelfull", "visit wuxiaworld",
     "read latest chapters at", "read advance chapters at",
-    "for more chapters,",
 ]
 
-_MIN_SUSPICIOUS_LINE_LEN = 15
-_CONTEXT_WINDOW          = 10
-_MAX_CONTEXT_BLOCKS      = 5
-
-# FIX v4: Thêm patterns bắt JS ad injection xuất hiện dưới dạng text.
-# Các site như novelfire.net nhúng <script>window.pubfuturetag...</script>
-# trực tiếp vào content div. Dù extract_text_blocks đã fix để skip <script>
-# tags, vẫn cần patterns này như safety net cho các dạng text-only injection.
 _SEED_PATTERNS_RAW: list[str] = [
-    # Existing
     r"^Tip:\s+You can use",
-
-    # Script tag appearing as text (site embeds raw HTML in content)
-    r"<script[\s>]",
-    r"</script>",
-
-    # Common ad network JS patterns
-    r"window\.pubfuturetag",
-    r"window\.googletag",
-    r"window\.adsbygoogle",
-    r"googletag\.cmd\.push",
-    r"adsbygoogle\.push",
-    r"\.pubads\(\)",
-
-    # Generic ad push pattern: window.X = window.X || []; window.X.push({...})
-    r"window\.\w+\s*=\s*window\.\w+\s*\|\|\s*\[\]",
-
-    # pubfuturetag specific (novelfire)
+    r"<script[\s>]", r"</script>",
+    r"window\.pubfuturetag", r"window\.googletag",
+    r"window\.adsbygoogle", r"googletag\.cmd\.push",
     r"pubfuturetag\.push\(",
     r'"unit"\s*:\s*"[^"]+"\s*,\s*"id"\s*:\s*"pf-',
+    r"window\.\w+\s*=\s*window\.\w+\s*\|\|\s*\[\]",
 ]
 
 
-class SimpleAdsFilter:
+class AdsFilter:
+    """Lọc ads/watermark bằng keyword và regex."""
 
     def __init__(self) -> None:
         self._keywords: set[str] = {kw.lower() for kw in _SEED_KEYWORDS}
         self._patterns: list[re.Pattern[str]] = []
-        for pat_str in _SEED_PATTERNS_RAW:
+        for raw in _SEED_PATTERNS_RAW:
             try:
-                self._patterns.append(re.compile(pat_str, re.IGNORECASE))
-            except re.error as e:
-                logger.warning("[AdsFilter] Seed pattern lỗi: %r — %s", pat_str, e)
+                self._patterns.append(re.compile(raw, re.IGNORECASE))
+            except re.error:
+                pass
+
+    # ── Factory ───────────────────────────────────────────────────────────────
 
     @classmethod
-    def load(cls) -> "SimpleAdsFilter":
+    def load(cls) -> "AdsFilter":
+        """Load từ file + seed keywords."""
         instance = cls()
         if not os.path.exists(ADS_DB_FILE):
             return instance
         try:
             with open(ADS_DB_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            loaded_kw = loaded_pat = 0
             for kw in data.get("keywords", []):
                 if isinstance(kw, str):
                     kw_lower = kw.lower().strip()
-                    if kw_lower and kw_lower not in instance._keywords:
+                    if kw_lower:
                         instance._keywords.add(kw_lower)
-                        loaded_kw += 1
-            for pat_str in data.get("patterns", []):
-                if isinstance(pat_str, str) and pat_str.strip():
+            for pat in data.get("patterns", []):
+                if isinstance(pat, str) and pat.strip():
                     try:
-                        instance._patterns.append(re.compile(pat_str.strip(), re.IGNORECASE))
-                        loaded_pat += 1
+                        instance._patterns.append(re.compile(pat.strip(), re.IGNORECASE))
                     except re.error:
                         pass
-            if loaded_kw or loaded_pat:
-                logger.info("[AdsFilter] Load %d kw + %d pat từ %s", loaded_kw, loaded_pat, ADS_DB_FILE)
         except Exception as e:
-            logger.warning("[AdsFilter] Không load được DB: %s", e)
+            logger.warning("[AdsFilter] Load thất bại: %s", e)
         return instance
 
     def save(self) -> None:
-        data = {
-            "keywords": sorted(self._keywords),
-            "patterns": [p.pattern for p in self._patterns],
-        }
+        os.makedirs(os.path.dirname(ADS_DB_FILE) or ".", exist_ok=True)
         tmp = ADS_DB_FILE + ".tmp"
         try:
+            data = {
+                "keywords": sorted(self._keywords),
+                "patterns": [p.pattern for p in self._patterns],
+            }
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
             os.replace(tmp, ADS_DB_FILE)
         except Exception as e:
-            logger.error("[AdsFilter] Không lưu được DB: %s", e)
+            logger.error("[AdsFilter] Lưu thất bại: %s", e)
             try:
                 if os.path.exists(tmp):
                     os.remove(tmp)
             except Exception:
                 pass
 
-    # ── Domain injection ──────────────────────────────────────────────────────
+    # ── Inject từ profile ─────────────────────────────────────────────────────
 
-    def inject_domain_keywords(self, keywords: list[str]) -> int:
-        """Inject domain_watermarks từ SiteProfileDict. Trả về số keyword mới."""
+    def inject_from_profile(self, profile: "SiteProfile") -> int:
+        """Inject ads_keywords_learned từ profile. Trả về số keyword mới."""
+        added = 0
+        for kw in profile.get("ads_keywords_learned") or []:
+            if not isinstance(kw, str):
+                continue
+            kw_lower = kw.lower().strip()
+            if kw_lower and kw_lower not in self._keywords:
+                self._keywords.add(kw_lower)
+                added += 1
+        return added
+
+    def add_keywords(self, keywords: list[str]) -> int:
+        """Thêm keywords mới. Trả về số keyword thực sự mới."""
         added = 0
         for kw in keywords:
             if not isinstance(kw, str):
@@ -157,93 +133,26 @@ class SimpleAdsFilter:
                 added += 1
         return added
 
-    def inject_domain_patterns(self, patterns: list[str]) -> int:
-        """Inject regex patterns từ domain profile."""
-        added = 0
-        existing = {p.pattern for p in self._patterns}
-        for pat_str in patterns:
-            if not isinstance(pat_str, str) or not pat_str.strip():
-                continue
-            if pat_str.strip() in existing:
-                continue
-            try:
-                self._patterns.append(re.compile(pat_str.strip(), re.IGNORECASE))
-                added += 1
-            except re.error as e:
-                logger.warning("[AdsFilter] Domain pattern lỗi: %r — %s", pat_str, e)
-        return added
+    # ── Core filtering ────────────────────────────────────────────────────────
 
-    # ── Core ──────────────────────────────────────────────────────────────────
-
-    def filter_content(self, text: str) -> str:
-        lines = text.splitlines()
-        kept  = [line for line in lines if not self._is_ads_line(line)]
+    def filter(self, text: str) -> str:
+        """Lọc ads khỏi text, gộp blank lines thừa."""
+        lines = [ln for ln in text.splitlines() if not self._is_ads(ln)]
         result: list[str] = []
-        blank_count = 0
-        for line in kept:
-            if not line.strip():
-                blank_count += 1
-                if blank_count <= 1:
-                    result.append(line)
+        blanks = 0
+        for ln in lines:
+            if not ln.strip():
+                blanks += 1
+                if blanks <= 1:
+                    result.append(ln)
             else:
-                blank_count = 0
-                result.append(line)
+                blanks = 0
+                result.append(ln)
         return "\n".join(result)
 
-    def build_ai_context_block(self, text: str) -> str | None:
-        lines = text.splitlines()
-        suspicious_indices = [i for i, line in enumerate(lines) if self._is_ads_line(line)]
-        if not suspicious_indices:
-            return None
-        blocks: list[str] = []
-        for idx in suspicious_indices[:_MAX_CONTEXT_BLOCKS]:
-            start = max(0, idx - _CONTEXT_WINDOW)
-            end   = min(len(lines), idx + _CONTEXT_WINDOW + 1)
-            context_lines = [
-                f">>> {lines[i]} <<<" if i == idx else lines[i]
-                for i in range(start, end)
-            ]
-            blocks.append("\n".join(context_lines))
-        return "\n\n---\n\n".join(blocks) if blocks else None
-
-    def update_from_ai_result(self, raw_json: str) -> int:
-        if not raw_json:
-            return 0
-        try:
-            data = json.loads(raw_json.strip())
-        except (json.JSONDecodeError, AttributeError, ValueError):
-            return 0
-        if not isinstance(data, dict) or not data.get("found"):
-            return 0
-        added = 0
-        for kw in data.get("keywords", []):
-            if not isinstance(kw, str):
-                continue
-            kw_lower = kw.lower().strip()
-            if kw_lower and kw_lower not in self._keywords:
-                self._keywords.add(kw_lower)
-                added += 1
-        for pat_str in data.get("patterns", []):
-            if not isinstance(pat_str, str) or not pat_str.strip():
-                continue
-            try:
-                self._patterns.append(re.compile(pat_str.strip(), re.IGNORECASE))
-                added += 1
-            except re.error:
-                pass
-        return added
-
-    @property
-    def keyword_count(self) -> int:
-        return len(self._keywords)
-
-    @property
-    def pattern_count(self) -> int:
-        return len(self._patterns)
-
-    def _is_ads_line(self, line: str) -> bool:
+    def _is_ads(self, line: str) -> bool:
         stripped = line.strip()
-        if len(stripped) < _MIN_SUSPICIOUS_LINE_LEN:
+        if len(stripped) < _MIN_LINE_LEN:
             return False
         lower = stripped.lower()
         for kw in self._keywords:
@@ -253,3 +162,7 @@ class SimpleAdsFilter:
             if pat.search(stripped):
                 return True
         return False
+
+    @property
+    def stats(self) -> str:
+        return f"{len(self._keywords)}kw/{len(self._patterns)}pat"

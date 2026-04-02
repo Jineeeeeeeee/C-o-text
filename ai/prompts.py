@@ -1,237 +1,244 @@
-# ai/prompts.py
 """
-ai/prompts.py — Quản lý tập trung tất cả prompt gửi Gemini.
+ai/prompts.py — Tập trung tất cả prompts gửi Gemini.
 
-CHANGES (v3):
-  calibration_review(): Prompt mới — AI phân tích issues từ N chương probe
-    và đề xuất CSS selector / profile fixes để retry calibration.
+Learning Phase (5 calls):
+  1. build_initial_profile   — Học selectors cơ bản từ Chapter 1
+  2. validate_selectors      — Xác nhận selectors từ Chapter 2
+  3. analyze_special_content — Bảng/toán/ký hiệu từ Chapter 3
+  4. analyze_formatting      — System box/spoiler/author note từ Chapter 4
+  5. final_crosscheck        — Tổng hợp & confidence score từ Chapter 5
 
-CHANGES (v2):
-  build_profile(): Prompt mở rộng — AI giờ trả về 7 field thay vì 3:
-    - has_chapter_dropdown, has_rel_next: behavior flags
-    - chapter_url_pattern: regex pattern
-    - site_notes: ghi chú đặc điểm site
+Utility:
+  find_first_chapter  — Tìm URL Chapter 1 từ trang Index
+  classify_and_find   — Phân loại trang + tìm next URL (emergency fallback)
 """
 from __future__ import annotations
 
 
-class PromptTemplates:
+class Prompts:
 
-    # ── Site profile (EXPANDED) ───────────────────────────────────────────────
+    # ═══════════════════════════════════════════════════════════════════════════
+    # LEARNING PHASE PROMPTS
+    # ═══════════════════════════════════════════════════════════════════════════
 
     @staticmethod
-    def build_profile(html_snippet: str, url: str) -> str:
-        return f"""Phân tích HTML trang chương truyện và trả về JSON mô tả cấu trúc site.
-URL: {url}
+    def learning_1_initial_profile(html_snippet: str, url: str) -> str:
+        return f"""Bạn là chuyên gia phân tích cấu trúc web novel site.
+Phân tích HTML của Chapter 1 và trích xuất thông tin cấu trúc site.
 
-HTML (rút gọn, tối đa 8000 ký tự):
+URL: {url}
+HTML (tối đa 10000 ký tự):
 {html_snippet}
 
-Yêu cầu JSON (CHỈ JSON, không có text khác, không markdown fence):
+Trả về JSON (CHỈ JSON thuần, không markdown fence, không comment):
 {{
-  "next_selector": "CSS selector tìm nút/link sang chương tiếp theo, hoặc null",
-  "title_selector": "CSS selector tìm tiêu đề chương, hoặc null",
-  "content_selector": "CSS selector vùng nội dung chính, hoặc null",
-  "has_chapter_dropdown": true,
-  "has_rel_next": false,
-  "chapter_url_pattern": "regex Python nhận diện URL chapter, hoặc null",
-  "site_notes": "ghi chú ngắn về đặc điểm site, hoặc null"
+  "content_selector": "CSS selector chứa TOÀN BỘ nội dung truyện (văn bản chương). Ưu tiên #id > .class cụ thể > tag[attr]. KHÔNG ĐƯỢC chọn body, html, main, hay element chứa sidebar/nav.",
+  "next_selector": "CSS selector của nút/link 'Next Chapter'. Phải là <a> hoặc <button> có href. null nếu không tìm thấy.",
+  "title_selector": "CSS selector của tiêu đề CHƯƠNG (không phải tên truyện). Thường là h1, h2, hoặc div.chapter-title. null nếu không rõ.",
+  "remove_selectors": ["CSS selectors của element cần XÓA trước khi extract: ads, donation banner, chapter nav ở đầu/cuối, social share buttons. Mảng rỗng [] nếu không có."],
+  "nav_type": "Cách tìm chapter tiếp theo: 'selector' (dùng next_selector), 'rel_next' (có <link rel=next>), 'slug_increment' (URL có số tăng dần), 'fanfic' (fanfiction.net /s/id/num/). null nếu không rõ.",
+  "chapter_url_pattern": "Regex Python nhận diện URL chapter của site này. VD royalroad: '/fiction/\\\\d+/[^/]+/chapter/\\\\d+'. null nếu không đủ thông tin.",
+  "requires_playwright": false,
+  "notes": "Ghi chú đặc biệt về site (JS-heavy, paywall, CDN, v.v.). null nếu không có."
+}}
+
+Quy tắc bắt buộc:
+- content_selector: test lại bằng cách đọc HTML — selector PHẢI match element chứa văn bản truyện thực sự
+- Nếu content div chứa nút Prev/Next bên trong → thêm các selector đó vào remove_selectors
+- requires_playwright: chỉ true nếu thấy bằng chứng site cần JS để render content (VD: div rỗng với data-src)
+- Trả null cho bất kỳ field nào không đủ bằng chứng, KHÔNG suy đoán bừa
+"""
+
+    @staticmethod
+    def learning_2_validate(html_snippet: str, url: str, current_selectors: dict) -> str:
+        return f"""Xác nhận CSS selectors đã học từ Chapter 1 có hoạt động đúng trên Chapter 2 không.
+
+URL Chapter 2: {url}
+Selectors cần xác nhận:
+  content_selector: {current_selectors.get('content_selector')!r}
+  next_selector:    {current_selectors.get('next_selector')!r}
+  title_selector:   {current_selectors.get('title_selector')!r}
+  remove_selectors: {current_selectors.get('remove_selectors', [])}
+
+HTML Chapter 2 (tối đa 8000 ký tự):
+{html_snippet}
+
+Kiểm tra từng selector:
+1. content_selector có match element chứa ≥300 ký tự nội dung truyện không?
+2. next_selector có match link/nút dẫn sang Chapter 3 không?
+3. title_selector có match tiêu đề chương không?
+
+Trả về JSON (CHỈ JSON thuần):
+{{
+  "content_valid": true,
+  "content_fix": null,
+  "next_valid": true,
+  "next_fix": null,
+  "title_valid": true,
+  "title_fix": null,
+  "remove_add": ["Thêm selector mới vào remove_selectors nếu thấy noise mới"],
+  "notes": "Nhận xét ngắn. null nếu không có."
 }}
 
 Quy tắc:
-- next_selector: ưu tiên nút "Next Chapter" / nút điều hướng chương tiếp
-- content_selector: PHẢI chứa nội dung truyện, KHÔNG được là body/html/main
-  Ưu tiên #id > .class cụ thể > tag[attribute]
-- has_chapter_dropdown: true nếu có <select> chọn chapter (ví dụ fanfiction.net)
-- has_rel_next: true nếu có <link rel="next" href="..."> trỏ đến chapter kế tiếp
-- chapter_url_pattern: regex Python (không flags), ví dụ:
-    fanfiction.net → "/s/\\\\d+/\\\\d+"
-    royalroad      → "/fiction/\\\\d+/[^/]+"
-    Trả null nếu không đủ thông tin
-- site_notes: ghi chú JS-heavy, paywall, watermark pattern, v.v. Trả null nếu không có
-- Trả null cho field không tìm được, KHÔNG bịa
-- Nếu element chứa <script>, selector đó KHÔNG hợp lệ
+- *_fix: chỉ điền nếu *_valid = false. Đưa ra selector TỐT HƠN dựa trên HTML Chapter 2.
+- remove_add: chỉ thêm nếu thấy element rõ ràng là noise/ads KHÔNG có trong Chapter 1
+- Nếu tất cả đều valid → tất cả trả true, các fix = null
 """
 
-    # ── Story ID guard ────────────────────────────────────────────────────────
-
     @staticmethod
-    def story_id(url_sample: str) -> str:
-        return f"""Phân tích các URL chương truyện sau và tìm story ID.
+    def learning_3_special_content(html_snippet: str, url: str) -> str:
+        return f"""Phân tích Chapter 3 để phát hiện nội dung đặc biệt: bảng, công thức toán, ký hiệu đặc biệt.
 
-URLs:
-{url_sample}
+URL Chapter 3: {url}
+HTML (tối đa 8000 ký tự):
+{html_snippet}
 
-Tìm phần CỐ ĐỊNH trong URL (story_id) và phần THAY ĐỔI (số chương).
-Trả về JSON (CHỈ JSON, không markdown fence):
+Trả về JSON (CHỈ JSON thuần):
 {{
-  "story_id": "phần cố định nhận dạng truyện này",
-  "story_id_regex": "regex Python để match URL hợp lệ của truyện này"
+  "has_tables": false,
+  "table_evidence": "Mô tả ngắn về bảng nếu có (VD: 'status table với stat numbers'). null nếu không có.",
+  "has_math": false,
+  "math_format": null,
+  "math_evidence": ["Ví dụ công thức thực tế tìm thấy trong HTML, tối đa 3"],
+  "special_symbols": ["Ký hiệu đặc biệt quan sát được ngoài ASCII thông thường: —, …, ™, ©, ·, →, ⟨⟩, v.v."],
+  "notes": "Ghi chú đặc biệt về nội dung. null nếu không có."
 }}
-"""
 
-    # ── Cross-story confirmation ──────────────────────────────────────────────
+Hướng dẫn math_format:
+  "latex"       — nội dung dùng $...$ hoặc $$...$$ (inline/block LaTeX)
+  "mathjax"     — nội dung dùng \\(...\\) hoặc \\[...\\] hoặc có class MathJax
+  "plain_unicode" — công thức viết bằng ký tự unicode thường (x², √, ∑, v.v.)
+  null          — không có công thức toán
+
+Kiểm tra kỹ: tìm <table>, <math>, class/id liên quan đến math, ký tự unicode ngoài ASCII.
+"""
 
     @staticmethod
-    def confirm_same_story(title1: str, url1: str, title2: str, url2: str) -> str:
-        return f"""Hai chương này có thuộc cùng một truyện không?
+    def learning_4_formatting(html_snippet: str, url: str) -> str:
+        return f"""Phân tích Chapter 4 để phát hiện các element định dạng đặc biệt:
+system notification box, hidden/spoiler text, author's note / translator's note.
 
-Chương 1: Tiêu đề: {title1!r} | URL: {url1}
-Chương 2: Tiêu đề: {title2!r} | URL: {url2}
+URL Chapter 4: {url}
+HTML (tối đa 8000 ký tự):
+{html_snippet}
 
-Trả về JSON (CHỈ JSON, không markdown fence):
-{{"same_story": true, "reason": "lý do ngắn gọn"}}
-hoặc
-{{"same_story": false, "reason": "lý do ngắn gọn"}}
+Trả về JSON (CHỈ JSON thuần):
+{{
+  "system_box": {{
+    "found": false,
+    "selectors": ["CSS selectors của system/notification box. VD: ['.well', 'div.system', '.panel-body']"],
+    "convert_to": "blockquote",
+    "prefix": "**System:**"
+  }},
+  "hidden_text": {{
+    "found": false,
+    "selectors": ["CSS selectors của spoiler/hidden text. VD: ['.spoiler', '.hidden', 'span[style*=color:white]']"],
+    "convert_to": "spoiler_tag"
+  }},
+  "author_note": {{
+    "found": false,
+    "selectors": ["CSS selectors của author note / TN. VD: ['.author-note', '.translator-note', '.an']"],
+    "convert_to": "blockquote_note"
+  }},
+  "bold_italic": true,
+  "hr_dividers": true,
+  "image_alt_text": false,
+  "notes": "Ghi chú về formatting đặc biệt khác. null nếu không có."
+}}
 
-Chú ý: chỉ trả false nếu rõ ràng là truyện KHÁC. Nếu không chắc, mặc định trả true.
+Hướng dẫn convert_to:
+  system_box  → "blockquote" (thêm > prefix) | "code_block" (nếu là code/data thuần)
+  hidden_text → "spoiler_tag" (||text||) | "strikethrough" (~~text~~) | "skip" (bỏ qua)
+  author_note → "blockquote_note" (> *Author's Note:*) | "italic_note" (*[AN: ...]*) | "skip"
+
+Chú ý: found=false nếu không thấy bằng chứng rõ ràng trong HTML. Không suy đoán.
+bold_italic: true nếu truyện dùng <strong>/<em> cho emphasis quan trọng (không phải UI buttons)
+hr_dividers: true nếu truyện dùng <hr> để ngăn cách section
 """
 
-    # ── First chapter finder ──────────────────────────────────────────────────
+    @staticmethod
+    def learning_5_final_crosscheck(html_snippet: str, url: str, accumulated_profile: dict) -> str:
+        return f"""Bạn đã phân tích 4 chương trước. Đây là Chapter 5 — hãy cross-check và finalize profile.
+
+URL Chapter 5: {url}
+HTML (tối đa 8000 ký tự):
+{html_snippet}
+
+Profile hiện tại (tích lũy từ 4 chapter trước):
+{_format_profile_summary(accumulated_profile)}
+
+Nhiệm vụ:
+1. Xác nhận content_selector/next_selector/title_selector có hoạt động trên Chapter 5 không
+2. Nếu cần fix → đưa ra selector final tốt nhất
+3. Scan Chapter 5 tìm ads/watermark text
+4. Đánh giá confidence tổng thể (0.0–1.0)
+
+Trả về JSON (CHỈ JSON thuần):
+{{
+  "content_selector_final": "Selector tốt nhất — giữ nguyên hoặc cải thiện. null chỉ khi không tìm được.",
+  "next_selector_final": "Selector tốt nhất hoặc null.",
+  "title_selector_final": "Selector tốt nhất hoặc null.",
+  "remove_selectors_final": ["Danh sách ĐẦYĐỦ các selectors cần remove (tích hợp tất cả từ 5 chương)"],
+  "ads_keywords": ["Watermark/ads text tìm thấy trong Chapter 5 content, lowercase. Tối đa 10 phrases."],
+  "confidence": 0.95,
+  "notes": "Tóm tắt ngắn về profile chất lượng và bất kỳ quirk nào của site."
+}}
+
+confidence rubric:
+  0.95–1.0: Tất cả selectors confirmed, nav hoạt động tốt, content clean
+  0.80–0.94: Selectors hoạt động nhưng có minor issues
+  0.60–0.79: Có 1-2 vấn đề chưa giải quyết được
+  < 0.60: Nhiều vấn đề, có thể cần manual review
+"""
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # UTILITY PROMPTS
+    # ═══════════════════════════════════════════════════════════════════════════
 
     @staticmethod
     def find_first_chapter(candidates: str, base_url: str) -> str:
-        return f"""Đây là các URL candidate cho chương đầu tiên của truyện:
+        return f"""Đây là các URL candidate cho Chapter 1 của truyện:
 {candidates}
 
 Trang nguồn: {base_url}
 
-Trả về JSON (CHỈ JSON, không markdown fence):
-{{"first_chapter_url": "URL chương đầu tiên (số nhỏ nhất / đầu tiên trong list)"}}
+Trả về JSON (CHỈ JSON thuần):
+{{"first_chapter_url": "URL của Chapter 1 — chương đầu tiên, số nhỏ nhất. null nếu không xác định được."}}
 """
 
-    # ── Page classifier + next URL ────────────────────────────────────────────
-
-    def classify_and_find(hint_block: str, html_snippet: str, base_url: str, domain_context: str | None = None) -> str:
-        prefix = f"Site context: {domain_context}\n\n" if domain_context else ""
-        return prefix + f"""Phân loại trang web và tìm URL chương tiếp theo.
+    @staticmethod
+    def classify_and_find(hint_block: str, html_snippet: str, base_url: str) -> str:
+        return f"""Phân loại trang và tìm URL chương tiếp theo (emergency fallback).
 
 URL hiện tại: {base_url}
-
-Link điều hướng tìm thấy:
+Link điều hướng:
 {hint_block}
 
-HTML (rút gọn, tối đa 6000 ký tự):
+HTML (tối đa 5000 ký tự):
 {html_snippet}
 
-Trả về JSON (CHỈ JSON, không markdown fence):
+Trả về JSON (CHỈ JSON thuần):
 {{
   "page_type": "chapter",
   "next_url": "URL chương tiếp theo hoặc null",
   "first_chapter_url": null
 }}
-hoặc nếu là trang index:
-{{
-  "page_type": "index",
-  "next_url": null,
-  "first_chapter_url": "URL chương đầu tiên"
-}}
 """
 
-    # ── Title validation ──────────────────────────────────────────────────────
 
-    @staticmethod
-    def validate_title(candidate: str, chapter_url: str, content_snippet: str) -> str:
-        return f"""Xác nhận tiêu đề chương truyện.
+# ── Helper ────────────────────────────────────────────────────────────────────
 
-URL: {chapter_url}
-Tiêu đề đề xuất: {candidate!r}
-Đoạn đầu nội dung trang (300 ký tự): {content_snippet[:300]!r}
-
-Trả về JSON (CHỈ JSON, không markdown fence):
-{{"valid": true, "title": "tiêu đề làm sạch"}}
-hoặc
-{{"valid": false, "title": null}}
-"""
-
-    # ── Ads detection ─────────────────────────────────────────────────────────
-
-    @staticmethod
-    def detect_ads(context_text: str) -> str:
-        return f"""You are a text filter assistant for web novel scrapers.
-
-Below are suspicious lines found in novel chapters. Each entry shows context
-BEFORE and AFTER the marked line. Use context to judge if the line is truly
-an injected watermark/ad (not story content).
-
-SUSPICIOUS LINES WITH CONTEXT:
-{context_text}
-
-Return ONLY a JSON object, no markdown, no extra text:
-{{
-  "found": true,
-  "keywords": ["short phrases to add to keyword list, lowercase, max 8"],
-  "patterns": ["python regex patterns, case-insensitive, max 5"],
-  "example_lines": ["exact text of the >>> marked lines <<< that ARE ads, verbatim, max 5"]
-}}
-
-If none of the marked lines are ads, return:
-{{"found": false, "keywords": [], "patterns": [], "example_lines": []}}"""
-
-
-# ── Profile refinement ────────────────────────────────────────────────────────
-
-    @staticmethod
-    def refine_profile(observations_summary: str) -> str:
-        return f"""Bạn đang review CSS selectors cho một web novel scraper.
-Dưới đây là structural signals quan sát được từ nhiều chương của cùng một site:
-
-{observations_summary}
-
-Nhiệm vụ: Dựa trên observations trên, đề xuất CSS selectors tốt nhất.
-Trả về JSON (CHỈ JSON, không markdown fence):
-{{
-  "content_selector": "CSS selector chứa nội dung chương, hoặc null",
-  "content_confidence": 0.0,
-  "title_selector": "CSS selector tiêu đề chương, hoặc null",
-  "title_confidence": 0.0,
-  "next_selector": "CSS selector nút/link Next Chapter, hoặc null",
-  "next_confidence": 0.0,
-  "notes": "ghi chú ngắn về site structure, hoặc null"
-}}
-
-Quy tắc:
-- confidence: float 0.0–1.0, phản ánh độ nhất quán trong observations
-  • >= 90% chapters có cùng pattern → confidence >= 0.9
-  • >= 70% chapters                 → confidence >= 0.7
-  • < 50% chapters                  → confidence < 0.5, nên trả null
-- Ưu tiên specificity: #id > .single-class > tag.class > tag
-- Selector phải trỏ đến element CHỨA content/title, không phải wrapper bên ngoài
-- content_selector: phải chứa body text truyện (> 200 ký tự), KHÔNG phải sidebar/header
-- next_selector: phải trỏ đến <a> hoặc <button> có href sang chương tiếp
-- Nếu current profile đã có selector đang hoạt động tốt (working_content_selector),
-  chỉ đề xuất thay thế nếu bạn thấy option tốt hơn rõ ràng (confidence >= 0.9)
-- Trả null cho bất kỳ field nào không đủ confidence, đừng bịa
-"""
-
-    # ── Calibration review ────────────────────────────────────────────────────
-
-    @staticmethod
-    def calibration_review(report: str, n_chapters: int = 10) -> str:
-        return f"""Bạn là chuyên gia phân tích web novel scraper.
-Dưới đây là kết quả thử nghiệm cào {n_chapters} chương đầu của một trang web.
-Phân tích issues và đề xuất cải thiện CSS selectors / cấu hình profile.
-
-{report}
-
-QUY TẮC ĐỀ XUẤT:
-- content_selector: PHẢI match container chứa ít nhất 300 ký tự nội dung truyện
-  (không phải sidebar, header, footer). Ưu tiên #id > .specific-class
-- next_selector: PHẢI match <a> hoặc <button> có href dẫn sang chương tiếp theo
-- title_selector: PHẢI match element chứa tiêu đề CHƯƠNG (không phải tên truyện)
-- has_nav_edges: true nếu content div chứa nút Next/Prev ở đầu/cuối cần strip
-- domain_watermarks: chỉ thêm nếu thấy text cụ thể trong content_preview
-- nav_type: "selector"|"rel_next"|"slug_increment"|"dropdown"|"fanfic" — chỉ set nếu rõ ràng
-- Nếu không có bằng chứng từ issues/preview → trả null, đừng bịa
-
-Trả về JSON (CHỈ JSON, không markdown fence):
-{{
-  "content_selector":  "CSS selector hoặc null",
-  "next_selector":     "CSS selector hoặc null",
-  "title_selector":    "CSS selector hoặc null",
-  "nav_type":          "loại nav hoặc null",
-  "has_nav_edges":     false,
-  "domain_watermarks": [],
-  "notes":             "giải thích ngắn gọn về các thay đổi"
-}}
-"""
+def _format_profile_summary(profile: dict) -> str:
+    lines = [
+        f"  content_selector:  {profile.get('content_selector')!r}",
+        f"  next_selector:     {profile.get('next_selector')!r}",
+        f"  title_selector:    {profile.get('title_selector')!r}",
+        f"  remove_selectors:  {profile.get('remove_selectors', [])}",
+        f"  nav_type:          {profile.get('nav_type')!r}",
+        f"  has_tables:        {profile.get('formatting_rules', {}).get('tables', False)}",
+        f"  has_math:          {profile.get('formatting_rules', {}).get('math_support', False)}",
+        f"  system_box:        {bool(profile.get('formatting_rules', {}).get('system_box', {}).get('found'))}",
+        f"  author_note:       {bool(profile.get('formatting_rules', {}).get('author_note', {}).get('found'))}",
+    ]
+    return "\n".join(lines)

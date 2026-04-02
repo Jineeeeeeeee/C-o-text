@@ -1,256 +1,163 @@
-# utils/types.py
 """
 utils/types.py — TypedDict definitions cho toàn bộ project.
 
-CHANGES (v5):
-  CalibrationIssue (NEW): Một issue phát hiện khi probe chương.
-  CalibrationRecord (NEW): Kết quả probe một chương (lưu content để ghi khi PASS).
-  ProgressDict: +calibration_done, +calibration_round, +calibration_urls.
-
-CHANGES (v4):
-  StructuralObservation (NEW): Snapshot cấu trúc DOM của một chương.
-    Tích lũy qua OBS_REFINE_AFTER chương rồi gửi AI để refine profile.
-
-  SiteProfileDict — Thêm NHÓM 8 (Structural observations):
-    observations, observation_count, profile_refined, refined_at_chapter
+SiteProfile là schema trung tâm — chứa tất cả thông tin học được từ
+Thorough Learning Mode và được dùng trong Full Scrape Mode.
 """
 from __future__ import annotations
-
 from typing import Optional, TypedDict
+
+
+# ── Formatting rules ──────────────────────────────────────────────────────────
+
+class SpecialElementRule(TypedDict, total=False):
+    """Rule chuyển đổi một loại element đặc biệt sang Markdown."""
+    found     : bool
+    selectors : list[str]   # CSS selectors: [".well", "div.system-box", "#notice"]
+    convert_to: str          # "blockquote" | "code_block" | "italic_note" | "spoiler_tag" | "skip"
+    prefix    : str          # Chỉ dùng với convert_to="blockquote", VD: "**System:**"
+
+
+class FormattingRules(TypedDict, total=False):
+    """
+    Tất cả quy tắc format được AI học từ Phase 2.
+    Được MarkdownFormatter đọc khi chuyển HTML → Markdown.
+    """
+    # Content structure
+    tables            : bool              # Có bảng HTML không?
+    bold_italic       : bool              # Giữ **bold** và *italic* không?
+    hr_dividers       : bool              # Giữ --- divider không?
+    image_alt_text    : bool              # Ghi alt text của ảnh không?
+
+    # Math
+    math_support      : bool              # Site có công thức toán không?
+    math_format       : Optional[str]     # "latex" | "mathjax" | "plain_unicode"
+
+    # Special elements (RPG/LitRPG)
+    system_box        : Optional[SpecialElementRule]   # Status box, skill notification
+    hidden_text       : Optional[SpecialElementRule]   # Spoiler, censored
+    author_note       : Optional[SpecialElementRule]   # Author's note / TN
+
+    # Ký hiệu đặc biệt quan sát được
+    special_symbols   : list[str]         # ["—", "…", "™", "©", "·"]
+
+
+# ── Site profile ──────────────────────────────────────────────────────────────
+
+class SiteProfile(TypedDict, total=False):
+    """
+    Profile đầy đủ cho một domain — persist qua các session.
+
+    Được tạo bởi Thorough Learning Mode (5 AI calls).
+    Đọc bởi Full Scrape Mode để extract + format không cần AI.
+    """
+    # Identity
+    domain        : str
+    last_learned  : str          # ISO datetime của lần học gần nhất
+    confidence    : float        # 0.0–1.0, tổng hợp từ AI Call #5
+
+    # Selectors (CSS)
+    content_selector : Optional[str]    # Element chứa nội dung truyện
+    next_selector    : Optional[str]    # Link/nút sang chương tiếp
+    title_selector   : Optional[str]    # Tiêu đề chương
+    remove_selectors : list[str]        # Elements cần xóa trước khi extract
+
+    # Navigation
+    nav_type             : Optional[str]   # "selector"|"rel_next"|"slug_increment"|"fanfic"
+    chapter_url_pattern  : Optional[str]   # Regex Python nhận diện URL chapter
+    requires_playwright  : bool
+
+    # Formatting rules (NEW — từ Phase 2)
+    formatting_rules  : FormattingRules
+
+    # Learned data
+    ads_keywords_learned : list[str]    # Keywords watermark học được
+    learned_chapters     : list[int]    # [1, 2, 3, 4, 5]
+    sample_urls          : list[str]    # URLs đã dùng để học
 
 
 # ── Progress ──────────────────────────────────────────────────────────────────
 
 class ProgressDict(TypedDict, total=False):
-    current_url:       Optional[str]
-    chapter_count:     int
-    story_title:       Optional[str]
-    all_visited_urls:  list[str]
-    fingerprints:      list[str]
-    collected_urls:    list[str]
-    story_id:          Optional[str]
-    story_id_regex:    Optional[str]
-    story_id_locked:   bool
-    story_id_attempts: int
-    completed:         bool
-    completed_at_url:  Optional[str]
-    last_scraped_url:  Optional[str]
-    last_title:        Optional[str]
-    # Calibration phase
-    calibration_done:  bool       # True sau khi calibration PASS
-    calibration_round: int        # Round hiện tại (resume nếu bị ngắt)
-    calibration_urls:  list[str]  # URLs đã probe trong round gần nhất
+    # Scraping state
+    current_url      : Optional[str]
+    chapter_count    : int
+    story_title      : Optional[str]
+    all_visited_urls : list[str]
+    fingerprints     : list[str]
+
+    # Story ID guard
+    story_id        : Optional[str]
+    story_id_regex  : Optional[str]
+    story_id_locked : bool
+
+    # Completion
+    completed        : bool
+    completed_at_url : Optional[str]
+
+    # Learning phase flag
+    learning_done : bool
+    start_url     : str    # URL gốc từ links.txt (dùng để re-scrape từ đầu)
 
 
-# ── Structural observation ────────────────────────────────────────────────────
-
-class StructuralObservation(TypedDict, total=False):
-    """
-    Snapshot cấu trúc DOM của một chương đã cào thành công.
-
-    Được tạo bởi dom_observer.observe_chapter_structure() và tích lũy
-    trong SiteProfileDict["observations"].
-
-    Sau OBS_REFINE_AFTER chương, ProfileManager tổng hợp tất cả observations
-    thành một summary và gửi AI (ask_ai_refine_profile) để tinh chỉnh profile
-    selectors với confidence score.
-
-    Chỉ lưu metadata (tag, classes, id) — KHÔNG lưu content text.
-    Tất cả field total=False để backward-compatible với profile cũ.
-    """
-    # ── Identity ──────────────────────────────────────────────────────────────
-    url:             str           # URL chương này
-    chapter_num:     int           # Số thứ tự chương
-
-    # ── Content element signals ───────────────────────────────────────────────
-    content_selector_hit: Optional[str]   # CSS selector đã win extract
-    content_tag:          Optional[str]   # div / article / section / ...
-    content_id:           Optional[str]   # id attribute của element
-    content_classes:      list[str]       # class list (tối đa 5)
-
-    # ── Title element signals ─────────────────────────────────────────────────
-    title_source:    Optional[str]   # nguồn win: "dropdown" | "h1" | "h2" |
-                                     # "class:chapter-title" | "og:title" |
-                                     # "itemprop:name" | "url_slug" | "content_heading"
-    title_tag:       Optional[str]   # tag của element chứa title text
-    title_id:        Optional[str]   # id attribute
-    title_classes:   list[str]       # class list (tối đa 5)
-
-    # ── Nav next element signals ──────────────────────────────────────────────
-    nav_next_tag:     Optional[str]  # a / button
-    nav_next_classes: list[str]      # class list
-    nav_next_text:    Optional[str]  # button text (truncated 40 chars)
-    nav_next_rel:     Optional[str]  # "next" nếu có rel="next"
-
-
-# ── Calibration ───────────────────────────────────────────────────────────────
-
-class CalibrationIssue(TypedDict, total=False):
-    """
-    Một issue phát hiện trong quá trình calibration probe.
-
-    issue_type:
-      "content_short"    — content sau xử lý < CALIBRATION_MIN_CONTENT chars
-      "title_suspicious" — title = "Không rõ tiêu đề" hoặc trông như URL slug
-      "ai_fallback"      — AI phải dùng để tìm content hoặc next URL
-      "no_next_url"      — không tìm được URL tiếp theo (cả heuristic lẫn AI)
-      "ads_leaked"       — còn suspicious content sau khi AdsFilter lọc
-      "fetch_failed"     — HTTP error hoặc junk page
-    """
-    issue_type: str
-    detail:     str
-
-
-class CalibrationRecord(TypedDict, total=False):
-    """
-    Kết quả probe một chương trong calibration phase.
-
-    Lưu toàn bộ processed content để ghi file khi calibration PASS.
-    Không ghi file trong quá trình probe — Option B.
-    """
-    chapter_num:       int
-    url:               str
-    title:             str
-    content:           str            # Full processed content — ghi file khi PASS
-    content_preview:   str            # 300 chars đầu — gửi AI review
-    content_length:    int
-    selector_used:     Optional[str]
-    title_source:      Optional[str]
-    ai_fallback_used:  bool
-    next_url:          Optional[str]  # URL chương tiếp theo
-    story_title:       Optional[str]  # Tên truyện (chỉ extract ở ch.1)
-    issues:            list           # list[CalibrationIssue]
-
-
-# ── Site profile ──────────────────────────────────────────────────────────────
-
-class SelectorStats(TypedDict, total=False):
-    """Hit/try stats cho một CSS selector cụ thể."""
-    hits:        int
-    total_tries: int
-
-
-class SiteProfileDict(TypedDict, total=False):
-    """
-    Profile đầy đủ cho một domain — persist qua các lần chạy.
-
-    NHÓM 1 — CSS Selectors (AI-generated):
-      next_selector, title_selector, content_selector
-
-    NHÓM 2 — Selector performance (tự cập nhật khi scrape):
-      working_content_selector: selector trong CONTENT_SELECTORS đã proven work.
-      selector_stats: {selector: {hits, total_tries}} — confidence tracking.
-
-    NHÓM 3 — Site behavior flags:
-      requires_playwright, has_nav_edges, has_chapter_dropdown, has_rel_next.
-
-    NHÓM 4 — URL knowledge:
-      chapter_url_pattern, sample_urls.
-
-    NHÓM 5 — Navigation:
-      nav_type: strategy đã biết cho site này.
-
-    NHÓM 6 — Watermarks (persist để inject vào AdsFilter ngay khi khởi động).
-
-    NHÓM 7 — Statistics & metadata.
-
-    NHÓM 8 — Structural observations (v4 NEW):
-      observations: list observations từ nhiều chương (tối đa OBS_MAX_STORED).
-      observation_count: tổng số observations đã record (không giảm khi trim).
-      profile_refined: đã qua AI refinement chưa → không trigger lại.
-      refined_at_chapter: chương nào đã trigger refinement.
-    """
-
-    # NHÓM 1 — CSS Selectors
-    next_selector:    Optional[str]
-    title_selector:   Optional[str]
-    content_selector: Optional[str]
-
-    # NHÓM 2 — Selector performance
-    working_content_selector:   Optional[str]
-    selector_stats:             dict[str, SelectorStats]
-
-    # NHÓM 3 — Behavior flags
-    requires_playwright:    bool
-    has_nav_edges:          bool
-    has_chapter_dropdown:   bool
-    has_rel_next:           bool
-
-    # NHÓM 4 — URL knowledge
-    chapter_url_pattern:    Optional[str]
-    sample_urls:            list[str]
-
-    # NHÓM 5 — Navigation
-    nav_type:               Optional[str]
-
-    # NHÓM 6 — Watermarks
-    domain_watermarks:      list[str]
-
-    # NHÓM 7 — Statistics
-    ai_fallback_count:              int
-    content_extraction_failures:    int
-    chapters_scraped:               int
-    last_updated:                   Optional[str]
-    profile_version:                int
-    site_notes:                     Optional[str]
-
-    # NHÓM 8 — Structural observations (v4 NEW)
-    observations:           list[StructuralObservation]
-    observation_count:      int        # Tổng obs đã record (monotonic)
-    profile_refined:        bool       # True sau khi AI refinement chạy xong
-    refined_at_chapter:     int        # Chapter number khi refinement diễn ra
-
-
-# ── AI results ────────────────────────────────────────────────────────────────
+# ── AI result types ───────────────────────────────────────────────────────────
 
 class AiClassifyResult(TypedDict, total=False):
-    page_type:         str
-    next_url:          Optional[str]
-    first_chapter_url: Optional[str]
+    page_type         : str
+    next_url          : Optional[str]
+    first_chapter_url : Optional[str]
 
 
-class StoryIdResult(TypedDict, total=False):
-    story_id:       str
-    story_id_regex: str
+class AiInitialProfile(TypedDict, total=False):
+    """Kết quả từ AI Call #1."""
+    content_selector    : Optional[str]
+    next_selector       : Optional[str]
+    title_selector      : Optional[str]
+    remove_selectors    : list[str]
+    nav_type            : Optional[str]
+    chapter_url_pattern : Optional[str]
+    requires_playwright : bool
+    notes               : Optional[str]
 
 
-# ── AI profile result (extended) ──────────────────────────────────────────────
-
-class AiProfileResult(TypedDict, total=False):
-    """
-    Kết quả đầy đủ từ ask_ai_build_profile (prompt mới).
-    Superset của SiteProfileDict — chỉ chứa những field AI có thể suy luận.
-    """
-    next_selector:        Optional[str]
-    title_selector:       Optional[str]
-    content_selector:     Optional[str]
-    nav_type:             Optional[str]
-    has_chapter_dropdown: bool
-    has_rel_next:         bool
-    chapter_url_regex:    Optional[str]
-    chapter_url_pattern:  Optional[str]
-    domain_watermarks:    list[str]
-    site_notes:           Optional[str]
-    ai_notes:             Optional[str]
+class AiValidation(TypedDict, total=False):
+    """Kết quả từ AI Call #2."""
+    content_selector_valid : bool
+    content_selector_fix   : Optional[str]
+    next_selector_valid    : bool
+    next_selector_fix      : Optional[str]
+    title_selector_valid   : bool
+    title_selector_fix     : Optional[str]
+    notes                  : Optional[str]
 
 
-# ── AI refinement result (v4 NEW) ─────────────────────────────────────────────
+class AiSpecialContent(TypedDict, total=False):
+    """Kết quả từ AI Call #3."""
+    has_tables      : bool
+    has_math        : bool
+    math_format     : Optional[str]
+    math_evidence   : list[str]
+    special_symbols : list[str]
+    notes           : Optional[str]
 
-class AiRefinedProfile(TypedDict, total=False):
-    """
-    Kết quả từ ask_ai_refine_profile() sau khi phân tích StructuralObservations.
 
-    Mỗi selector đi kèm confidence score (0.0–1.0).
-    ProfileManager.merge_refined_result() chỉ apply field nếu confidence
-    >= OBS_CONFIDENCE_MIN (mặc định 0.8).
-    """
-    content_selector:   Optional[str]
-    content_confidence: float    # 0.0–1.0
+class AiFormattingAnalysis(TypedDict, total=False):
+    """Kết quả từ AI Call #4."""
+    system_box          : dict
+    hidden_text         : dict
+    author_note         : dict
+    bold_italic         : bool
+    hr_dividers         : bool
+    image_alt_text      : bool
+    notes               : Optional[str]
 
-    title_selector:     Optional[str]
-    title_confidence:   float
 
-    next_selector:      Optional[str]
-    next_confidence:    float
-
-    notes:              Optional[str]  # Ghi chú tùy ý từ AI
+class AiFinalCrosscheck(TypedDict, total=False):
+    """Kết quả từ AI Call #5."""
+    confidence              : float
+    content_selector_final  : Optional[str]
+    next_selector_final     : Optional[str]
+    title_selector_final    : Optional[str]
+    remove_selectors_final  : list[str]
+    ads_keywords            : list[str]
+    notes                   : Optional[str]
