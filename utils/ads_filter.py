@@ -1,16 +1,9 @@
 """
-utils/ads_filter.py — v3: Lọc watermark/ads + session logging + AI verify pipeline.
+utils/ads_filter.py — v4: Lọc watermark/ads + session logging + AI verify + blacklist generic keywords.
 
-Thay đổi so với v2:
-  - Session logging: ghi lại mọi dòng bị lọc kèm chapter URL
-  - get_session_summary(): aggregate log → {line: {count, urls}}
-  - get_unknown_candidates(): top N dòng chưa có trong seed/domain keywords
-  - save_pending_review(): lưu log ra data/ads_review/<domain>_pending.json
-  - apply_verified(): thêm confirmed keywords vào domain bucket
-  - filter(text, chapter_url=""): accept url để log context
-
-Fix #1: get_unknown_candidates() dùng substring check (khớp với _is_ads logic)
-  thay vì equality check trước đây — tránh gửi AI những dòng đã được cover bởi keyword.
+Thay đổi so với v3:
+  - add_keywords(): thêm blacklist từ generic/short (search, log in, read, find, chapter, story, etc.)
+  - Tránh học keyword < 8 ký tự hoặc quá rõ ràng là từ story
 """
 from __future__ import annotations
 
@@ -75,6 +68,22 @@ _SEED_PATTERNS_RAW: list[str] = [
     r"window\.\w+\s*=\s*window\.\w+\s*\|\|\s*\[\]",
 ]
 
+# FIX: Blacklist từ generic/short để tránh học keywords sai
+_GENERIC_KEYWORD_BLACKLIST: frozenset[str] = frozenset({
+    # Quá short hoặc quá generic
+    "search", "log in", "login", "read", "find", "chapter", "story",
+    "novel", "series", "book", "text", "content", "page", "link", "click",
+    "here", "site", "web", "online", "free",
+    
+    # Từ site được loại trừ (sẽ match cả nội dung)
+    "royal road", "royalroad", "fanfiction", "wattpad", "webnovel",
+    "scribble", "archive", "ao3",
+    
+    # Tiêu đề story/tên nhân vật hay bị nhầm
+    "the primal hunter", "monster cultivator", "system", "bloodline",
+    "realm", "cultivation", "dungeon", "quest", "skill", "class",
+})
+
 
 class AdsFilter:
     """
@@ -110,7 +119,7 @@ class AdsFilter:
         # Session log (reset mỗi phiên scrape)
         self._session_log: list[dict] = []
 
-    # ── Factory ───────────────────────────────────────────────────────────────
+    # ── Factory ───────────────────────────────────────────────────────────
 
     @classmethod
     def load(cls, domain: str | None = None) -> "AdsFilter":
@@ -189,7 +198,7 @@ class AdsFilter:
             except Exception:
                 pass
 
-    # ── Inject từ profile ─────────────────────────────────────────────────────
+    # ── Inject từ profile ─────────────────────────────────────────────────
 
     def inject_from_profile(self, profile: "SiteProfile") -> int:
         """Inject ads_keywords_learned từ profile → domain bucket."""
@@ -208,25 +217,47 @@ class AdsFilter:
         return added
 
     def add_keywords(self, keywords: list[str], to_domain: bool = True) -> int:
-        """Thêm keywords mới vào domain bucket (default) hoặc global."""
+        """
+        Thêm keywords mới vào domain bucket (default) hoặc global.
+        
+        FIX: Bỏ qua keyword nếu:
+          1. Trong blacklist generic (search, log in, etc.)
+          2. Quá short (< 8 ký tự)
+          3. Đã trong global hoặc domain bucket
+        """
         added = 0
         use_domain = to_domain and bool(self._domain)
+        
         for kw in keywords:
             if not isinstance(kw, str):
                 continue
             kw_lower = kw.lower().strip()
             if not kw_lower:
                 continue
+            
+            # FIX: Skip blacklist generic keywords
+            if kw_lower in _GENERIC_KEYWORD_BLACKLIST:
+                logger.debug(f"[AdsFilter] Skip blacklist keyword: {kw_lower!r}")
+                continue
+            
+            # Skip quá short
+            if len(kw_lower) < 8:
+                logger.debug(f"[AdsFilter] Skip too short keyword: {kw_lower!r}")
+                continue
+            
+            # Skip nếu đã tồn tại
             if kw_lower in self._global_keywords or kw_lower in self._domain_keywords:
                 continue
+            
             if use_domain:
                 self._domain_keywords.add(kw_lower)
             else:
                 self._global_keywords.add(kw_lower)
             added += 1
+        
         return added
 
-    # ── Core filtering ────────────────────────────────────────────────────────
+    # ── Core filtering ────────────────────────────────────────────────────
 
     def filter(self, text: str, chapter_url: str = "") -> str:
         """
@@ -278,7 +309,7 @@ class AdsFilter:
                 return True
         return False
 
-    # ── Session log API ───────────────────────────────────────────────────────
+    # ── Session log API ───────────────────────────────────────────────────
 
     def get_session_summary(self) -> dict[str, dict]:
         """
@@ -339,7 +370,7 @@ class AdsFilter:
         """Thêm AI-confirmed lines vào domain keyword bucket."""
         return self.add_keywords(confirmed_lines, to_domain=True)
 
-    # ── Persistent review file ────────────────────────────────────────────────
+    # ── Persistent review file ────────────────────────────────────────────
 
     def save_pending_review(
         self,

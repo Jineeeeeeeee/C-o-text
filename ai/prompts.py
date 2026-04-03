@@ -18,9 +18,62 @@ from __future__ import annotations
 
 class Prompts:
 
-    # ═══════════════════════════════════════════════════════════════════════════
-    # LEARNING PHASE PROMPTS
-    # ═══════════════════════════════════════════════════════════════════════════
+    @staticmethod
+    def learning_5_final_crosscheck(html_snippet: str, url: str, accumulated_profile: dict) -> str:
+        """
+        FIX: Cải thiện tiêu chí phân biệt watermark cố định vs nội dung truyện biến động.
+        Tránh học keyword quá generic hoặc nội dung story.
+        """
+        return f"""Bạn đã phân tích 4 chương trước. Đây là Chapter 5 — hãy cross-check và finalize profile.
+
+URL Chapter 5: {url}
+HTML (tối đa 8000 ký tự):
+{html_snippet}
+
+Profile hiện tại (tích lũy từ 4 chapter trước):
+{_format_profile_summary(accumulated_profile)}
+
+Nhiệm vụ:
+1. Xác nhận content_selector/next_selector/title_selector có hoạt động trên Chapter 5 không
+2. Nếu cần fix → đưa ra selector final tốt nhất
+3. **QUAN TRỌNG**: Scan Chapter 5 tìm **CHỈ watermark/ads cố định** (lặp lại ở HẦUHẾT chapters)
+4. Đánh giá confidence tổng thể (0.0–1.0)
+
+Trả về JSON (CHỈ JSON thuần):
+{{
+  "content_selector_final": "Selector tốt nhất — giữ nguyên hoặc cải thiện. null chỉ khi không tìm được.",
+  "next_selector_final": "Selector tốt nhất hoặc null.",
+  "title_selector_final": "Selector tốt nhất hoặc null.",
+  "remove_selectors_final": ["Danh sách ĐẦYĐỦ các selectors cần remove (tích hợp tất cả từ 5 chương)"],
+  "ads_keywords": ["Chỉ watermark/ads CỐ ĐỊNH xuất hiện ≥80% chapters, lowercase. Tối đa 10."],
+  "confidence": 0.95,
+  "notes": "Tóm tắt ngắn về profile chất lượng và bất kỳ quirk nào của site."
+}}
+
+TIÊU CHÍ ADS KEYWORDS (✓ GIỮ vs ✗ LOẠI):
+
+✓ GIỮ LẠI - Watermark cố định (lặp lại hầu hết chapters):
+  • "Tip: You can use left, right keyboard keys..." (lặp 100/74 chapters)
+  • "If you find any errors, please let us know..." (lặp 74/74 chapters)
+  • "Read at [site]" / "Visit [site]" / "Find this novel at..." (lặp nhiều chapters)
+  • <script type="text/javascript">window.pubfuturetag...</script> (lặp 40+ chapters)
+  • Boilerplate disclaimer của site (đặc trưng, lặp lại)
+
+✗ LOẠI BỎ - Nội dung truyện hoặc từ generic:
+  • "Searching for" / "searching" (chỉ vài chapters, là nội dung story)
+  • "the primal hunter" / "bloodline of the primal hunter" (tên story/skill, nội dung)
+  • "search" / "log in" / "read" / "find" (quá generic, match cả nội dung truyện)
+  • "royal road" (tên site generic, match dialogue nhân vật)
+  • Tên nhân vật, tên skill, hoặc plot elements (biến động, không cố định)
+  • Dialogue hoặc narrative của story (part của content, không watermark)
+  • Single-chapter/rare entries (chỉ xuất hiện 1-3 chapters)
+
+confidence rubric:
+  0.95–1.0: Tất cả selectors confirmed, nav tốt, content clean, ads rõ ràng cố định
+  0.80–0.94: Selectors hoạt động nhưng có minor issues
+  0.60–0.79: Có 1-2 vấn đề chưa giải quyết được
+  < 0.60: Nhiều vấn đề, cần manual review
+"""
 
     @staticmethod
     def learning_1_initial_profile(html_snippet: str, url: str) -> str:
@@ -148,45 +201,6 @@ Trả về JSON (CHỈ JSON thuần):
 """
 
     @staticmethod
-    def learning_5_final_crosscheck(html_snippet: str, url: str, accumulated_profile: dict) -> str:
-        return f"""Bạn đã phân tích 4 chương trước. Đây là Chapter 5 — hãy cross-check và finalize profile.
-
-URL Chapter 5: {url}
-HTML (tối đa 8000 ký tự):
-{html_snippet}
-
-Profile hiện tại (tích lũy từ 4 chapter trước):
-{_format_profile_summary(accumulated_profile)}
-
-Nhiệm vụ:
-1. Xác nhận content_selector/next_selector/title_selector có hoạt động trên Chapter 5 không
-2. Nếu cần fix → đưa ra selector final tốt nhất
-3. Scan Chapter 5 tìm ads/watermark text
-4. Đánh giá confidence tổng thể (0.0–1.0)
-
-Trả về JSON (CHỈ JSON thuần):
-{{
-  "content_selector_final": "Selector tốt nhất — giữ nguyên hoặc cải thiện. null chỉ khi không tìm được.",
-  "next_selector_final": "Selector tốt nhất hoặc null.",
-  "title_selector_final": "Selector tốt nhất hoặc null.",
-  "remove_selectors_final": ["Danh sách ĐẦYĐỦ các selectors cần remove (tích hợp tất cả từ 5 chương)"],
-  "ads_keywords": ["Watermark/ads text tìm thấy trong Chapter 5 content, lowercase. Tối đa 10 phrases."],
-  "confidence": 0.95,
-  "notes": "Tóm tắt ngắn về profile chất lượng và bất kỳ quirk nào của site."
-}}
-
-confidence rubric:
-  0.95–1.0: Tất cả selectors confirmed, nav hoạt động tốt, content clean
-  0.80–0.94: Selectors hoạt động nhưng có minor issues
-  0.60–0.79: Có 1-2 vấn đề chưa giải quyết được
-  < 0.60: Nhiều vấn đề, có thể cần manual review
-"""
-
-    # ═══════════════════════════════════════════════════════════════════════════
-    # UTILITY PROMPTS
-    # ═══════════════════════════════════════════════════════════════════════════
-
-    @staticmethod
     def find_first_chapter(candidates: str, base_url: str) -> str:
         return f"""Đây là các URL candidate cho Chapter 1 của truyện:
 {candidates}
@@ -246,6 +260,7 @@ KHÔNG PHẢI ADS (xác nhận là FALSE — false positive):
   ✗ Nội dung truyện đề cập dịch thuật/ngôn ngữ trong context câu chuyện
   ✗ Mô tả sách/tài liệu trong fictional world
   ✗ Bất kỳ câu nào rõ ràng là văn học hư cấu
+  ✗ Từ quá generic ("search", "log in", "read") nếu match cả nội dung truyện
 
 Trả về JSON (CHỈ JSON thuần, không markdown fence):
 {{

@@ -1,11 +1,9 @@
 """
-core/scraper.py — v10: Profile-aware start detection + Story ID guard.
+core/scraper.py — v11: Xóa progress file TRƯỚC learning phase để tránh race condition.
 
-Thay đổi so với v9:
-  Fix #2: find_start_chapter() dùng profile.chapter_url_pattern để detect
-          chapter URL chính xác hơn RE_CHAP_URL (cover sites có URL format lạ)
-  Fix #3: _build_story_id_regex() + lock story ID sau khi xác định start URL
-          ngăn scraper đi lạc sang story khác khi next_url bị redirect sai
+Thay đổi so với v10:
+  FIX: Khi phát hiện cần learning phase, xóa progress file ngay lập tức.
+       Tránh race condition với full scrape mode load progress cũ.
 """
 from __future__ import annotations
 
@@ -481,6 +479,16 @@ async def run_novel_task(
 
     # ── Phase 1 → 2: Learning (nếu cần) ──────────────────────────────────────
     if not pm.has(domain) or not pm.is_profile_fresh(domain):
+        # FIX: Xóa progress file NGAY LẬP TỨC khi phát hiện cần learning.
+        # Điều này tránh race condition với full scrape mode load progress cũ
+        # trong khi learning phase vẫn đang chạy.
+        if os.path.exists(progress_path):
+            try:
+                os.remove(progress_path)
+                print(f"  [Learn] 🗑 Cleared old progress to avoid race condition", flush=True)
+            except Exception as e:
+                logger.warning("[Learn] Failed to clear progress: %s", e)
+        
         from learning.phase import run_learning_phase
         profile = await run_learning_phase(start_url, pool, pw_pool, pm, ai_limiter)
         if profile is None:
