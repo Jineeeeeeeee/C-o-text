@@ -1,15 +1,11 @@
 """
-core/scraper.py — v7: Simplified Full Scrape Mode.
+core/scraper.py — v8: Full Scrape Mode (fixed nav-edge stripping + per-domain ads).
 
-Sau khi Learning Phase hoàn tất và profile được save:
-  - run_novel_task() reset progress, bắt đầu scrape từ Ch.1
-  - scrape_one_chapter() dùng profile để extract + format
-  - Không có calibration, không có observation, không có profile refinement
-  - AI chỉ gọi khi: next URL mất (emergency fallback), page type không rõ
-
-Pipeline per-chapter:
-  Fetch → html_filter (hidden + remove_selectors) → extract_chapter (formatter)
-  → ads_filter → fingerprint check → save .md → find next URL
+Thay đổi so với v7:
+  - _strip_nav_edges(): chỉ strip LIÊN TIẾP từ đầu/cuối, break ngay khi gặp content
+    → Sửa bug bỏ sót 2-3 đoạn đầu chương do blank lines bị nhận nhầm là nav
+  - AdsFilter.load(domain=domain) thay vì load() không có domain
+    → Keywords per-domain, không filter nhầm content trên site khác
 """
 from __future__ import annotations
 
@@ -51,38 +47,62 @@ _NAV_EDGE_SCAN = 7
 
 
 def _strip_nav_edges(text: str) -> str:
-    """Xóa nav header/footer lặp lại ở đầu/cuối content block."""
+    """
+    Xóa nav header/footer lặp lại ở đầu/cuối content block.
+
+    FIX v8: Chỉ strip LIÊN TIẾP từ đầu/cuối — break ngay khi gặp dòng content thật.
+    Phiên bản cũ dùng "last nav in top 7" làm start, khiến blank lines giữa các
+    đoạn đầu bị nhận là nav → cắt mất 2-3 đoạn đầu chương.
+    """
     lines = text.splitlines()
     n = len(lines)
     if n < 8:
         return text
+
     EDGE = _NAV_EDGE_SCAN
+
+    # Tìm các dòng xuất hiện ở cả đầu lẫn cuối → nav lặp lại (Prev/Next/Index...)
     top_set = {lines[i].strip() for i in range(min(EDGE, n)) if lines[i].strip()}
-    bot_set = {lines[n-1-i].strip() for i in range(min(EDGE, n)) if lines[n-1-i].strip()}
+    bot_set = {lines[n - 1 - i].strip() for i in range(min(EDGE, n)) if lines[n - 1 - i].strip()}
     repeated = top_set & bot_set
 
     def _is_nav(line: str) -> bool:
         s = line.strip()
-        if not s: return True
-        if _RE_WORD_COUNT.match(s): return True
-        if len(s) <= 10 and re.match(r"^[A-Za-z\s]+$", s): return True
+        if not s:
+            return True   # blank line: bỏ qua nhưng KHÔNG dùng để xác định start
+        if _RE_WORD_COUNT.match(s):
+            return True
+        if len(s) <= 10 and re.match(r"^[A-Za-z\s]+$", s):
+            return True
         return s in repeated
 
-    last_top_nav = -1
+    # ── Strip đầu: LIÊN TIẾP, break ngay khi gặp content ────────────────────
+    start = 0
     for i in range(min(EDGE, n)):
         if _is_nav(lines[i]):
-            last_top_nav = i
-    start = last_top_nav + 1
+            start = i + 1   # dòng này là nav/blank → tiếp tục
+        else:
+            break           # dòng này là content thật → dừng ngay
+
+    # Bỏ qua blank lines sau nav header
     while start < n and not lines[start].strip():
         start += 1
+
+    # ── Strip cuối: LIÊN TIẾP, break ngay khi gặp content ───────────────────
     end = n
     for i in range(min(EDGE, n)):
         idx = n - 1 - i
-        if idx <= start: break
-        if not lines[idx].strip() or _is_nav(lines[idx]): end = idx
-        else: break
-    while end > start and not lines[end-1].strip():
+        if idx <= start:
+            break
+        if not lines[idx].strip() or _is_nav(lines[idx]):
+            end = idx
+        else:
+            break   # Đã có ở đây từ v7, giữ nguyên
+
+    # Bỏ qua blank lines trước nav footer
+    while end > start and not lines[end - 1].strip():
         end -= 1
+
     return "\n".join(lines[start:end]) if start < end else text
 
 
@@ -201,7 +221,6 @@ async def scrape_one_chapter(
     content, title, selector = await asyncio.to_thread(extract_chapter, soup, url, profile)
 
     if not content or len(content.strip()) < 100:
-        # Emergency: thử AI classify để tìm next URL
         print(f"  [Skip] {len((content or '').strip())} chars — bỏ qua: {url[:60]}", flush=True)
         return await _find_next_and_save(url, progress, progress_path, pool, pw_pool, profile, ai_limiter)
 
@@ -226,7 +245,6 @@ async def scrape_one_chapter(
 
     # ── Story title (ch.1 only) ───────────────────────────────────────────────
     if not progress.get("story_title") and progress.get("chapter_count", 0) == 0:
-        # Heuristic: tên truyện thường nằm trước "|", "–", "—" trong <title>
         title_tag = soup.find("title")
         if title_tag:
             raw = title_tag.get_text(strip=True)
@@ -260,7 +278,6 @@ async def scrape_one_chapter(
     next_url = find_next_url(soup, url, profile)
 
     if not next_url:
-        # Emergency AI fallback
         try:
             ai_result = await ai_classify_and_find(html, url, ai_limiter)
             if ai_result:
@@ -348,8 +365,11 @@ async def run_novel_task(
       3. Full Scrape Mode loop
     """
     os.makedirs(output_dir, exist_ok=True)
-    domain     = urlparse(start_url).netloc.lower()
-    ads_filter = AdsFilter.load()
+    domain = urlparse(start_url).netloc.lower()
+
+    # ── Load AdsFilter với domain context ────────────────────────────────────
+    # domain-aware: chỉ áp dụng keywords của domain này, không lẫn với site khác
+    ads_filter = AdsFilter.load(domain=domain)
 
     # ── Phase 1 → 2: Learning (nếu cần) ──────────────────────────────────────
     if not pm.has(domain) or not pm.is_profile_fresh(domain):
@@ -359,7 +379,7 @@ async def run_novel_task(
             print(f"  [ERR] Learning Phase thất bại cho {domain}. Bỏ qua.", flush=True)
             return
 
-        # Inject learned ads keywords
+        # Inject learned ads keywords vào domain bucket
         injected = ads_filter.inject_from_profile(profile)
         if injected > 0:
             print(f"  [Ads] +{injected} keywords từ profile ({ads_filter.stats})", flush=True)

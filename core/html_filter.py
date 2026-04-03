@@ -108,6 +108,9 @@ def _extract_css_hidden_classes(soup: BeautifulSoup) -> frozenset[str]:
 
 
 def _is_hidden(el: Tag, dynamic_hidden: frozenset[str]) -> bool:
+    # Guard: attrs có thể là None trên một số Tag trong bs4 mới
+    if not el.attrs:
+        return False
     if el.has_attr("hidden"):
         return True
     if el.get("aria-hidden") == "true":
