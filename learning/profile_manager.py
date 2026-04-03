@@ -92,5 +92,3 @@ class ProfileManager:
             logger.error("[ProfileManager] Lưu thất bại: %s", e)
 
 
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()

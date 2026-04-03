@@ -226,12 +226,13 @@ async def scrape_one_chapter(
 
     # ── Story title (ch.1 only) ───────────────────────────────────────────────
     if not progress.get("story_title") and progress.get("chapter_count", 0) == 0:
-        # Heuristic: tên truyện thường nằm trước "–" hoặc "|" trong <title>
+        # Heuristic: tên truyện thường nằm trước "|", "–", "—" trong <title>
         title_tag = soup.find("title")
         if title_tag:
             raw = title_tag.get_text(strip=True)
-            if "|" in raw:
-                story_candidate = normalize_title(raw.split("|")[0].strip())
+            m = re.search(r"[\|–—]", raw)
+            if m:
+                story_candidate = normalize_title(raw[: m.start()].strip())
                 if len(story_candidate) > 3:
                     progress["story_title"] = story_candidate
 

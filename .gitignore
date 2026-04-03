@@ -8,7 +8,7 @@ env/
 output/
 progress_*.json
 data/site_profiles.json
-data/ADs_keyword.json
+data/ads_keywords.json
 links.txt
 
 # Python
