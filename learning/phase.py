@@ -36,8 +36,13 @@ async def run_learning_phase(
     pm         : ProfileManager,
     ai_limiter : AIRateLimiter,
 ) -> SiteProfile | None:
+    from core.scraper import _dtag  # import local để tránh circular
     domain = urlparse(start_url).netloc.lower()
-    print(f"\n🎓 [Learn] Bắt đầu Thorough Learning Mode cho {domain}", flush=True)
+    tag    = _dtag(domain)
+
+    print(f"\n{'═'*62}", flush=True)
+    print(f"  🎓 Learning: {domain}", flush=True)
+    print(f"{'═'*62}", flush=True)
 
     chapters, ai1_result = await _fetch_chapters(
         start_url, pool, pw_pool, pm, ai_limiter, domain
@@ -45,17 +50,16 @@ async def run_learning_phase(
 
     if len(chapters) < 2:
         print(
-            f"  [Learn] ✗ Chỉ fetch được {len(chapters)}/{LEARNING_CHAPTERS} chapters. "
-            f"Cần ít nhất 2 để học.",
+            f"  [{tag}] ✗ Chỉ fetch được {len(chapters)}/{LEARNING_CHAPTERS} chapters.",
             flush=True,
         )
         return None
 
     if ai1_result is None:
-        print(f"  [Learn] ✗ AI #1 thất bại — không thể build profile.", flush=True)
+        print(f"  [{tag}] ✗ AI #1 thất bại.", flush=True)
         return None
 
-    print(f"  [Learn] ✓ Fetch xong {len(chapters)}/{LEARNING_CHAPTERS} chapters", flush=True)
+    print(f"  [{tag}] ✓ {len(chapters)}/{LEARNING_CHAPTERS} chapters fetched", flush=True)
 
     profile = await _run_ai_calls(chapters, domain, ai_limiter, ai1_result)
     if profile is None:
@@ -64,22 +68,19 @@ async def run_learning_phase(
     await pm.save_profile(domain, profile)
     fr = profile.get("formatting_rules") or {}
     print(
-        f"\n  [Learn] ✅ Profile saved!\n"
-        f"     confidence   = {profile.get('confidence', 0):.2f}\n"
-        f"     content_sel  = {profile.get('content_selector')!r}\n"
-        f"     next_sel     = {profile.get('next_selector')!r}\n"
-        f"     title_sel    = {profile.get('title_selector')!r}\n"
-        f"     remove_sels  = {profile.get('remove_selectors', [])}\n"
-        f"     nav_type     = {profile.get('nav_type')!r}\n"
-        f"     tables       = {fr.get('tables', False)}\n"
-        f"     math         = {fr.get('math_support', False)}"
-        + (f" [{fr.get('math_format')}]" if fr.get('math_support') else "") + "\n"
-        f"     system_box   = {bool(fr.get('system_box', {}).get('found'))}\n"
-        f"     hidden_text  = {bool(fr.get('hidden_text', {}).get('found'))}\n"
-        f"     author_note  = {bool(fr.get('author_note', {}).get('found'))}\n"
-        f"     ads_keywords = {len(profile.get('ads_keywords_learned', []))}",
+        f"\n  [{tag}] ✅ Profile saved!\n"
+        f"     confidence  = {profile.get('confidence', 0):.2f}\n"
+        f"     content     = {profile.get('content_selector')!r}\n"
+        f"     next        = {profile.get('next_selector')!r}\n"
+        f"     title       = {profile.get('title_selector')!r}\n"
+        f"     remove      = {profile.get('remove_selectors', [])}\n"
+        f"     nav_type    = {profile.get('nav_type')!r}\n"
+        f"     tables/math = {fr.get('tables', False)} / {fr.get('math_support', False)}\n"
+        f"     system_box  = {bool(fr.get('system_box', {}).get('found'))}\n"
+        f"     ads_kw      = {len(profile.get('ads_keywords_learned', []))}",
         flush=True,
     )
+    print(f"{'═'*62}\n", flush=True)
 
     return profile
 
@@ -100,20 +101,20 @@ async def _fetch_chapters(
     # ── FIX: Nếu start_url là trang Index → tìm Chapter 1 thật sự trước ─────
     current_url = start_url
     if not RE_CHAP_URL.search(start_url):
-        print(f"  [Learn] 📋 start_url có vẻ là trang Index → tìm Chapter 1...", flush=True)
+        print(f"  [{tag}] 📋 start_url có vẻ là trang Index → tìm Chapter 1...", flush=True)
         try:
             status, index_html = await pw_pool.fetch(start_url)
             if not is_junk_page(index_html, status):
                 first_url = await ai_find_first_chapter(index_html, start_url, ai_limiter)
                 if first_url and first_url != start_url:
-                    print(f"  [Learn] ✅ Chapter 1: {first_url[:70]}", flush=True)
+                    print(f"  [{tag}] ✅ Chapter 1: {first_url[:70]}", flush=True)
                     current_url = first_url
                 else:
-                    print(f"  [Learn] ⚠ Không tìm được Chapter 1, dùng start_url", flush=True)
+                    print(f"  [{tag}] ⚠ Không tìm được Chapter 1, dùng start_url", flush=True)
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            print(f"  [Learn] ⚠ Index detection thất bại: {e}", flush=True)
+            print(f"  [{tag}] ⚠ Index detection thất bại: {e}", flush=True)
 
     temp_profile: SiteProfile = pm.get(domain)  # type: ignore[assignment]
 
@@ -122,7 +123,7 @@ async def _fetch_chapters(
             break
 
         print(
-            f"  [Learn] Fetch Ch.{i+1}/{LEARNING_CHAPTERS} → {current_url[:65]}",
+            f"  [{tag}] Fetch Ch.{i+1}/{LEARNING_CHAPTERS} → {current_url[:65]}",
             flush=True,
         )
 
@@ -134,17 +135,17 @@ async def _fetch_chapters(
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            print(f"  [Learn] ⚠ Fetch Ch.{i+1} thất bại: {e}", flush=True)
+            print(f"  [{tag}] ⚠ Fetch Ch.{i+1} thất bại: {e}", flush=True)
             break
 
         if is_junk_page(html, status):
-            print(f"  [Learn] ⚠ Ch.{i+1} junk page (status={status})", flush=True)
+            print(f"  [{tag}] ⚠ Ch.{i+1} junk page (status={status})", flush=True)
             break
 
         chapters.append((current_url, html))
 
         if i == 0:
-            print(f"  [Learn] 🤖 AI #1: Build initial profile...", flush=True)
+            print(f"  [{tag}] 🤖 AI #1: Build initial profile...", flush=True)
             ai1_result = await ai_build_initial_profile(html, current_url, ai_limiter)
             if ai1_result:
                 temp_profile = _apply_ai1_to_profile(temp_profile, ai1_result)
@@ -155,7 +156,7 @@ async def _fetch_chapters(
                     flush=True,
                 )
             else:
-                print(f"  [Learn] ⚠ AI #1 thất bại — navigation fallback mode", flush=True)
+                print(f"  [{tag}] ⚠ AI #1 thất bại — navigation fallback mode", flush=True)
 
         if i < LEARNING_CHAPTERS - 1:
             soup     = BeautifulSoup(html, "html.parser")
@@ -163,7 +164,7 @@ async def _fetch_chapters(
 
             if not next_url:
                 print(
-                    f"  [Learn] ⚠ Heuristic navigation thất bại Ch.{i+1} → thử AI...",
+                    f"  [{tag}] ⚠ Heuristic navigation thất bại Ch.{i+1} → thử AI...",
                     flush=True,
                 )
                 try:
@@ -173,10 +174,10 @@ async def _fetch_chapters(
                 except asyncio.CancelledError:
                     raise
                 except Exception as e:
-                    logger.warning("[Learn] AI nav thất bại: %s", e)
+                    logger.warning("[%s] AI nav thất bại: %s", e)
 
             if not next_url:
-                print(f"  [Learn] ⚠ Không tìm được next URL sau Ch.{i+1}", flush=True)
+                print(f"  [{tag}] ⚠ Không tìm được next URL sau Ch.{i+1}", flush=True)
                 break
 
             current_url = next_url

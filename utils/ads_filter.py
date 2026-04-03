@@ -129,7 +129,11 @@ class AdsFilter:
             return instance
         try:
             with open(ADS_DB_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
+                raw = f.read().strip()
+            # FIX: file rỗng (mới tạo) → bỏ qua, không crash
+            if not raw:
+                return instance
+            data = json.loads(raw)
             if "global" in data:
                 _load_bucket(data["global"], instance._global_keywords, instance._global_patterns)
                 if domain and "domains" in data:
@@ -146,6 +150,52 @@ class AdsFilter:
         except Exception as e:
             logger.warning("[AdsFilter] Load thất bại: %s", e)
         return instance
+
+    def get_candidates_by_frequency(
+        self,
+        auto_threshold: int = 5,
+        min_count: int = 2,
+        max_results: int = 20,
+    ) -> tuple[list[str], list[str]]:
+        """
+        Phân loại unknown candidates theo tần suất xuất hiện:
+
+        - auto_add  (count ≥ auto_threshold): lặp đủ nhiều → thêm trực tiếp,
+          không cần AI xác nhận. Tín hiệu mạnh vì watermark thật thường
+          xuất hiện hầu hết chapters.
+        - ai_verify (min_count ≤ count < auto_threshold): lặp ít → gửi AI
+          phân biệt ads thật vs false positive.
+
+        Cả hai nhóm đều đã loại trừ lines covered bởi keyword hiện tại
+        (substring check giống _is_ads).
+
+        Returns:
+            (auto_add, ai_verify)
+        """
+        summary = self.get_session_summary()
+        auto_add:  list[str] = []
+        ai_verify: list[str] = []
+
+        for line, info in sorted(summary.items(), key=lambda x: -x[1]["count"]):
+            count = info["count"]
+            if count < min_count:
+                continue
+            lower = line.lower()
+            already_known = (
+                any(kw in lower for kw in self._global_keywords)
+                or any(kw in lower for kw in self._domain_keywords)
+            )
+            if already_known:
+                continue
+
+            if count >= auto_threshold:
+                if len(auto_add) < max_results:
+                    auto_add.append(line)
+            else:
+                if len(ai_verify) < max_results:
+                    ai_verify.append(line)
+
+        return auto_add, ai_verify
 
     def save(self) -> None:
         """Lưu tất cả keywords/patterns xuống file (merge, không overwrite domain khác)."""

@@ -1,3 +1,4 @@
+# core/html_filter.py
 """
 core/html_filter.py — Xóa elements ẩn, noise, và remove_selectors từ profile.
 
@@ -6,6 +7,7 @@ Pipeline:
   2. strip_noise_tags: xóa script/style/noscript/iframe/svg...
   3. remove_hidden_elements: xóa hidden attr, aria-hidden, CSS display:none
   4. remove_profile_selectors: xóa elements theo remove_selectors từ profile
+     ⚠ Bỏ qua nếu element nằm BÊN TRONG content_selector (tránh tự nuking content)
 """
 from __future__ import annotations
 
@@ -55,13 +57,18 @@ _CSS_HIDDEN_RULE_RE = re.compile(
 def prepare_soup(
     html: str,
     remove_selectors: list[str] | None = None,
+    content_selector: str | None = None,
 ) -> BeautifulSoup:
     """
     Parse HTML và chạy full cleaning pipeline.
 
     Args:
-        html: Raw HTML string
-        remove_selectors: CSS selectors từ profile để xóa (VD: [".ads", ".donate-btn"])
+        html:              Raw HTML string
+        remove_selectors:  CSS selectors từ profile để xóa (VD: [".ads", ".donate-btn"])
+        content_selector:  CSS selector của content area — các element BÊN TRONG
+                           vùng này sẽ KHÔNG bị xóa bởi remove_selectors.
+                           Ngăn trường hợp AI học selector như "div#storytext > div"
+                           vô tình xóa luôn nội dung truyện.
 
     Returns:
         Cleaned BeautifulSoup object
@@ -77,19 +84,31 @@ def prepare_soup(
             el.decompose()
 
     # Bước 3: Xóa hidden elements
-    removed = 0
     for el in list(soup.find_all(True)):
         if not isinstance(el, Tag):
             continue
         if _is_hidden(el, dynamic_hidden):
             el.decompose()
-            removed += 1
 
     # Bước 4: Xóa profile-specified selectors
+    # ── QUAN TRỌNG: bỏ qua nếu element nằm trong content_selector ────────────
     if remove_selectors:
+        content_el: Tag | None = None
+        if content_selector:
+            try:
+                content_el = soup.select_one(content_selector)
+            except Exception:
+                pass
+
         for sel in remove_selectors:
             try:
                 for el in list(soup.select(sel)):
+                    # Không xóa content element hoặc element con của nó
+                    if content_el is not None and (
+                        el is content_el
+                        or content_el in el.parents
+                    ):
+                        continue
                     el.decompose()
             except Exception:
                 pass
@@ -108,7 +127,6 @@ def _extract_css_hidden_classes(soup: BeautifulSoup) -> frozenset[str]:
 
 
 def _is_hidden(el: Tag, dynamic_hidden: frozenset[str]) -> bool:
-    # Guard: attrs có thể là None trên một số Tag trong bs4 mới
     if not el.attrs:
         return False
     if el.has_attr("hidden"):

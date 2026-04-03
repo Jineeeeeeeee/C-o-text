@@ -170,12 +170,19 @@ class PlaywrightPool:
             if self._stealth:
                 await self._stealth(page)
             resp = await page.goto(url, wait_until="domcontentloaded", timeout=60_000)
+
             # Chờ CF challenge timeout
+            # FIX: wrap page.title() trong try/except — nếu page navigate trong lúc chờ
+            # thì "Execution context was destroyed" sẽ được bắt và vòng lặp dừng lại
             for _ in range(20):
-                title = (await page.title()).strip().lower()
+                try:
+                    title = (await page.title()).strip().lower()
+                except Exception:
+                    break   # Page đã navigate xong, CF cleared
                 if title not in CF_CHALLENGE_TITLES:
                     break
                 await page.wait_for_timeout(1_000)
+
             html   = await page.content()
             status = resp.status if resp else 200
             return status, html
@@ -184,9 +191,3 @@ class PlaywrightPool:
                 await context.close()
             except Exception:
                 pass
-
-    async def close(self) -> None:
-        if not self._started:
-            return
-        async with self._lock:
-            await self._cleanup()
