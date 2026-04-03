@@ -7,9 +7,9 @@ env/
 # Output & progress
 output/
 progress_*.json
-data/site_profiles.json
-data/ads_keywords.json
+data/
 links.txt
+progress/
 
 # Python
 __pycache__/
