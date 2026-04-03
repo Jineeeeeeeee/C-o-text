@@ -367,7 +367,7 @@ async def run_novel_task(
         # Reset progress để scrape lại từ Ch.1 với profile đầy đủ
         print(f"\n🔄 Reset progress → scrape lại từ Chapter 1 với profile hoàn chỉnh...", flush=True)
         await save_progress(progress_path, {
-            "current_url"     : start_url,
+            "current_url"     : None,
             "chapter_count"   : 0,
             "story_title"     : None,
             "all_visited_urls": [],
@@ -444,7 +444,12 @@ async def run_novel_task(
 
         except Exception as e:
             consecutive_errors += 1
-            print(f"  [ERR #{consecutive_errors}] {type(e).__name__}: {e}", flush=True)
+            import traceback
+            print(
+                f"  [ERR #{consecutive_errors}] {type(e).__name__}: {e}\n"
+                f"{traceback.format_exc()}",
+                flush=True,
+            )
             if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
                 break
 

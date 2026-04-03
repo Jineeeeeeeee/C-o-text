@@ -107,8 +107,7 @@ FALLBACK_CONTENT_SELECTORS: list[str] = [
 # ── Regex compile sẵn ────────────────────────────────────────────────────────
 RE_CHAP_URL = re.compile(
     r"(chapter|chuong|chap|/c|/ch|episode|ep|part)[_-]?\d+"
-    r"|/s/\d+/\d+"
-    r"|/fiction/\d+/[^/]+$",
+    r"|/s/\d+/\d+",
     re.IGNORECASE,
 )
 

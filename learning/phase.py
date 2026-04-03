@@ -1,24 +1,4 @@
-"""
-learning/phase.py — Thorough Learning Mode: 5 AI calls để build complete profile.
-
-Flow:
-  1. Fetch Chapter 1 (Playwright full render)
-  2. AI #1 interleaved ngay sau Ch.1 → get next_selector để navigate
-  3. Fetch Chapters 2–5 dùng profile tạm thời (có next_selector từ AI #1)
-  4. AI #2 → validate selectors với Chapter 2
-  5. AI #3 → analyze special content (tables, math) với Chapter 3
-  6. AI #4 → analyze formatting (system box, spoiler, author note) với Chapter 4
-  7. AI #5 → final cross-check + confidence score với Chapter 5
-  8. Merge tất cả → SiteProfile hoàn chỉnh
-  9. Save profile → Phase 3 scrape lại từ Ch.1
-
-TỔNG: 5 AI calls, không gọi trùng.
-
-Tại sao Playwright cho Ch.1:
-  - Ch.1 là nền tảng của toàn bộ profile
-  - Một số site render content qua JS (data-src, lazy load)
-  - Chi phí nhỏ (1 lần) nhưng đảm bảo HTML đầy đủ nhất
-"""
+# learning/phase.py
 from __future__ import annotations
 
 import asyncio
@@ -28,7 +8,7 @@ from urllib.parse import urlparse
 
 from bs4 import BeautifulSoup
 
-from config import LEARNING_CHAPTERS, get_delay
+from config import LEARNING_CHAPTERS, get_delay, RE_CHAP_URL
 from utils.types import SiteProfile
 from utils.string_helpers import is_junk_page
 from core.fetch        import fetch_page
@@ -43,6 +23,7 @@ from ai.agents  import (
     ai_analyze_formatting,
     ai_final_crosscheck,
     ai_classify_and_find,
+    ai_find_first_chapter,
 )
 
 logger = logging.getLogger(__name__)
@@ -55,20 +36,9 @@ async def run_learning_phase(
     pm         : ProfileManager,
     ai_limiter : AIRateLimiter,
 ) -> SiteProfile | None:
-    """
-    Chạy Thorough Learning Mode.
-
-    Returns:
-        SiteProfile hoàn chỉnh nếu thành công
-        None nếu thất bại (ít nhất 2 chapters phải fetch được và AI #1 phải pass)
-    """
     domain = urlparse(start_url).netloc.lower()
     print(f"\n🎓 [Learn] Bắt đầu Thorough Learning Mode cho {domain}", flush=True)
 
-    # ── Bước 1: Fetch chapters + AI #1 interleaved ────────────────────────────
-    # _fetch_chapters trả về (chapters, ai1_result).
-    # AI #1 chạy ngay sau Ch.1 (không phải cuối) để có next_selector cho Ch.2+.
-    # _run_ai_calls nhận ai1_result → không cần gọi AI #1 lần thứ hai.
     chapters, ai1_result = await _fetch_chapters(
         start_url, pool, pw_pool, pm, ai_limiter, domain
     )
@@ -87,12 +57,10 @@ async def run_learning_phase(
 
     print(f"  [Learn] ✓ Fetch xong {len(chapters)}/{LEARNING_CHAPTERS} chapters", flush=True)
 
-    # ── Bước 2–5: AI calls #2–5 ──────────────────────────────────────────────
     profile = await _run_ai_calls(chapters, domain, ai_limiter, ai1_result)
     if profile is None:
         return None
 
-    # ── Bước 6: Save profile ──────────────────────────────────────────────────
     await pm.save_profile(domain, profile)
     fr = profile.get("formatting_rules") or {}
     print(
@@ -126,19 +94,27 @@ async def _fetch_chapters(
     ai_limiter : AIRateLimiter,
     domain     : str,
 ) -> tuple[list[tuple[str, str]], dict | None]:
-    """
-    Fetch LEARNING_CHAPTERS chapters và chạy AI #1 interleaved sau Ch.1.
-
-    Returns:
-        (chapters, ai1_result)
-        chapters   : list[(url, html)] theo thứ tự
-        ai1_result : dict từ ai_build_initial_profile, hoặc None nếu thất bại
-    """
     chapters:   list[tuple[str, str]] = []
     ai1_result: dict | None           = None
 
+    # ── FIX: Nếu start_url là trang Index → tìm Chapter 1 thật sự trước ─────
     current_url = start_url
-    # Giữ profile tạm (có thể đã có từ lần chạy trước, hoặc empty dict)
+    if not RE_CHAP_URL.search(start_url):
+        print(f"  [Learn] 📋 start_url có vẻ là trang Index → tìm Chapter 1...", flush=True)
+        try:
+            status, index_html = await pw_pool.fetch(start_url)
+            if not is_junk_page(index_html, status):
+                first_url = await ai_find_first_chapter(index_html, start_url, ai_limiter)
+                if first_url and first_url != start_url:
+                    print(f"  [Learn] ✅ Chapter 1: {first_url[:70]}", flush=True)
+                    current_url = first_url
+                else:
+                    print(f"  [Learn] ⚠ Không tìm được Chapter 1, dùng start_url", flush=True)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            print(f"  [Learn] ⚠ Index detection thất bại: {e}", flush=True)
+
     temp_profile: SiteProfile = pm.get(domain)  # type: ignore[assignment]
 
     for i in range(LEARNING_CHAPTERS):
@@ -150,10 +126,8 @@ async def _fetch_chapters(
             flush=True,
         )
 
-        # ── Fetch ─────────────────────────────────────────────────────────────
         try:
             if i == 0:
-                # Ch.1: luôn Playwright để đảm bảo full JS render
                 status, html = await pw_pool.fetch(current_url)
             else:
                 status, html = await fetch_page(current_url, pool, pw_pool)
@@ -169,10 +143,6 @@ async def _fetch_chapters(
 
         chapters.append((current_url, html))
 
-        # ── AI #1: chạy ngay sau Ch.1 ─────────────────────────────────────────
-        # Mục đích kép:
-        #   a) Lấy next_selector để navigate sang Ch.2 ngay
-        #   b) Lưu result để _run_ai_calls dùng lại — KHÔNG gọi lại
         if i == 0:
             print(f"  [Learn] 🤖 AI #1: Build initial profile...", flush=True)
             ai1_result = await ai_build_initial_profile(html, current_url, ai_limiter)
@@ -186,9 +156,7 @@ async def _fetch_chapters(
                 )
             else:
                 print(f"  [Learn] ⚠ AI #1 thất bại — navigation fallback mode", flush=True)
-                # Vẫn tiếp tục: sẽ dùng heuristic để navigate
 
-        # ── Tìm next URL ──────────────────────────────────────────────────────
         if i < LEARNING_CHAPTERS - 1:
             soup     = BeautifulSoup(html, "html.parser")
             next_url = find_next_url(soup, current_url, temp_profile)
@@ -212,18 +180,12 @@ async def _fetch_chapters(
                 break
 
             current_url = next_url
-
-            # Delay lịch sự giữa các chapters
             await asyncio.sleep(get_delay(current_url))
 
     return chapters, ai1_result
 
 
 def _apply_ai1_to_profile(base: SiteProfile, ai1: dict) -> SiteProfile:
-    """
-    Merge kết quả AI #1 vào base profile tạm thời.
-    Chỉ dùng để navigation trong Learning Phase — không lưu xuống disk.
-    """
     result = dict(base)
     for field in (
         "content_selector", "next_selector", "title_selector",
@@ -246,18 +208,9 @@ async def _run_ai_calls(
     ai_limiter : AIRateLimiter,
     ai1_result : dict,
 ) -> SiteProfile | None:
-    """
-    Orchestrate AI calls #2–5 và build SiteProfile hoàn chỉnh.
-
-    ai1_result đã được gọi trong _fetch_chapters (interleaved) — nhận qua tham số,
-    không gọi lại để tránh lãng phí quota.
-
-    Tổng AI calls: 1 (AI#1 từ fetch) + tối đa 4 (AI#2–5) = tối đa 5.
-    """
     urls  = [url  for url,  _ in chapters]
     htmls = [html for _, html in chapters]
 
-    # State tích lũy — bắt đầu từ kết quả AI #1
     acc: dict = {
         "content_selector"   : ai1_result.get("content_selector"),
         "next_selector"      : ai1_result.get("next_selector"),
@@ -269,7 +222,6 @@ async def _run_ai_calls(
         "formatting_rules"   : {},
     }
 
-    # ── AI #2: Validate selectors với Ch.2 ───────────────────────────────────
     if len(htmls) >= 2:
         print(f"  [Learn] 🤖 AI #2: Validate selectors với Ch.2...", flush=True)
         ai2 = await ai_validate_selectors(htmls[1], urls[1], acc, ai_limiter)
@@ -294,7 +246,6 @@ async def _run_ai_calls(
         else:
             print(f"  [Learn] ⚠ AI #2 thất bại — giữ selectors từ AI #1", flush=True)
 
-    # ── AI #3: Special content (tables, math, symbols) từ Ch.3 ───────────────
     if len(htmls) >= 3:
         print(f"  [Learn] 🤖 AI #3: Detect tables / math / symbols từ Ch.3...", flush=True)
         ai3 = await ai_analyze_special_content(htmls[2], urls[2], ai_limiter)
@@ -313,7 +264,6 @@ async def _run_ai_calls(
         else:
             print(f"  [Learn] ⚠ AI #3 thất bại — skip special content detection", flush=True)
 
-    # ── AI #4: Formatting analysis (boxes, spoilers, notes) từ Ch.4 ──────────
     if len(htmls) >= 4:
         print(f"  [Learn] 🤖 AI #4: Analyze formatting elements từ Ch.4...", flush=True)
         ai4 = await ai_analyze_formatting(htmls[3], urls[3], ai_limiter)
@@ -331,7 +281,6 @@ async def _run_ai_calls(
         else:
             print(f"  [Learn] ⚠ AI #4 thất bại — skip formatting analysis", flush=True)
 
-    # ── AI #5: Final cross-check + confidence ────────────────────────────────
     confidence:   float      = _default_confidence(len(htmls))
     ads_keywords: list[str]  = []
 
@@ -339,7 +288,6 @@ async def _run_ai_calls(
         print(f"  [Learn] 🤖 AI #5: Final cross-check + confidence score...", flush=True)
         ai5 = await ai_final_crosscheck(htmls[4], urls[4], acc, ai_limiter)
         if ai5:
-            # Áp dụng final selector tweaks
             for field, key in (
                 ("content_selector", "content_selector_final"),
                 ("next_selector",    "next_selector_final"),
@@ -351,7 +299,6 @@ async def _run_ai_calls(
                         print(f"     → {field} refined: {val!r}", flush=True)
                     acc[field] = val
 
-            # Final remove_selectors: dùng danh sách tổng hợp từ AI #5
             final_rm = ai5.get("remove_selectors_final")
             if isinstance(final_rm, list) and final_rm:
                 acc["remove_selectors"] = final_rm
@@ -367,7 +314,6 @@ async def _run_ai_calls(
             flush=True,
         )
 
-    # ── Build final SiteProfile ───────────────────────────────────────────────
     profile: SiteProfile = {
         "domain"             : domain,
         "last_learned"       : _now_iso(),
@@ -388,14 +334,7 @@ async def _run_ai_calls(
     return profile
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
-
 def _default_confidence(n_chapters: int) -> float:
-    """
-    Confidence mặc định khi AI #5 không chạy được.
-    Tỉ lệ với số chapters đã probe.
-    """
-    # 1 ch → 0.5, 2 ch → 0.6, 3 ch → 0.7, 4 ch → 0.75
     return min(0.5 + 0.1 * (n_chapters - 1), 0.75)
 
 
