@@ -8,6 +8,9 @@ Thay đổi so với v2:
   - save_pending_review(): lưu log ra data/ads_review/<domain>_pending.json
   - apply_verified(): thêm confirmed keywords vào domain bucket
   - filter(text, chapter_url=""): accept url để log context
+
+Fix #1: get_unknown_candidates() dùng substring check (khớp với _is_ads logic)
+  thay vì equality check trước đây — tránh gửi AI những dòng đã được cover bởi keyword.
 """
 from __future__ import annotations
 
@@ -303,8 +306,14 @@ class AdsFilter:
         max_results: int = 20,
     ) -> list[str]:
         """
-        Trả về top N dòng bị filter mà CHƯA có trong seed/domain keywords.
+        Trả về top N dòng bị filter mà CHƯA được cover bởi keyword đã biết.
         Dùng để gửi AI xác nhận xem có phải ads thật không.
+
+        Fix #1: Dùng substring check (giống _is_ads) thay vì equality check.
+        Lý do: _is_ads lọc bằng `kw in lower` (substring), nên một dòng như
+        "This content is stolen from royalroad" bị filter vì chứa "stolen content",
+        nhưng equality check `lower in self._global_keywords` lại không khớp
+        → dòng đó bị đưa vào candidates AI một cách thừa thãi.
 
         min_count: chỉ lấy dòng xuất hiện >= N lần (tránh one-off false positive)
         """
@@ -314,8 +323,12 @@ class AdsFilter:
             if info["count"] < min_count:
                 continue
             lower = line.lower()
-            # Bỏ qua những gì đã biết rõ là ads
-            if lower in self._global_keywords or lower in self._domain_keywords:
+            # Substring check — khớp với logic trong _is_ads()
+            already_known = (
+                any(kw in lower for kw in self._global_keywords)
+                or any(kw in lower for kw in self._domain_keywords)
+            )
+            if already_known:
                 continue
             candidates.append(line)
             if len(candidates) >= max_results:
@@ -336,11 +349,6 @@ class AdsFilter:
         """
         Merge session log vào file review bền vững.
         Format: data/ads_review/<domain_slug>_pending.json
-
-        verified_results: {line: True(confirmed ads) / False(false positive)}
-          None = chưa verify (pending)
-
-        Returns: đường dẫn file nếu có data, None nếu không có gì để ghi.
         """
         summary = self.get_session_summary()
         if not summary:
@@ -349,7 +357,6 @@ class AdsFilter:
         os.makedirs(_ADS_REVIEW_DIR, exist_ok=True)
         review_path = os.path.join(_ADS_REVIEW_DIR, f"{domain_slug}_pending.json")
 
-        # Load existing entries
         existing: dict[str, dict] = {}
         if os.path.exists(review_path):
             try:
@@ -360,7 +367,6 @@ class AdsFilter:
             except Exception:
                 pass
 
-        # Merge session data vào existing
         now_iso = datetime.now(timezone.utc).isoformat()
         for line, info in summary.items():
             verified = (verified_results or {}).get(line, None)

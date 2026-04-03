@@ -1,12 +1,11 @@
 """
-core/scraper.py — v9: Session ads logging + Ctrl+C safe finalization.
+core/scraper.py — v10: Profile-aware start detection + Story ID guard.
 
-Thay đổi so với v8:
-  - ads_filter.filter(content, chapter_url=url): log mọi dòng bị filter kèm URL
-  - run_novel_task dùng try/finally: đảm bảo profile + ads luôn được ghi disk
-    dù là hoàn thành bình thường, lỗi, hay Ctrl+C
-  - _finalize_ads(): AI verify candidates → apply → save pending review → save DB
-    (AI verify chỉ chạy khi NOT cancelled)
+Thay đổi so với v9:
+  Fix #2: find_start_chapter() dùng profile.chapter_url_pattern để detect
+          chapter URL chính xác hơn RE_CHAP_URL (cover sites có URL format lạ)
+  Fix #3: _build_story_id_regex() + lock story ID sau khi xác định start URL
+          ngăn scraper đi lạc sang story khác khi next_url bị redirect sai
 """
 from __future__ import annotations
 
@@ -100,6 +99,76 @@ def _strip_nav_edges(text: str) -> str:
     return "\n".join(lines[start:end]) if start < end else text
 
 
+# ── Story ID guard ────────────────────────────────────────────────────────────
+
+def _build_story_id_regex(url: str) -> str | None:
+    """
+    Trích pattern định danh story từ URL chapter để lock navigation.
+    Ngăn scraper đi lạc sang story khác khi next_url bị redirect sai.
+
+    Logic: tìm segment path đầu tiên chứa numeric ID (story ID),
+    dùng phần path trước + ID đó làm anchor regex.
+
+    Examples:
+        https://www.fanfiction.net/s/12345678/3/Title  → r'/s/12345678/'
+        https://www.royalroad.com/fiction/55418/slug/chapter/123
+                                                        → r'/fiction/55418/'
+        https://novelfire.net/novel-name/chapter-1      → None (không có numeric ID)
+
+    Returns:
+        Escaped regex string hoặc None nếu không extract được.
+    """
+    try:
+        path     = urlparse(url).path  # e.g. /fiction/55418/slug/chapter/123
+        segments = [s for s in path.split("/") if s]
+
+        # fanfiction.net: /s/{story_id}/{chap_num}/...
+        if len(segments) >= 3 and segments[0] == "s" and segments[1].isdigit():
+            story_path = f"/s/{segments[1]}/"
+            return re.escape(story_path)
+
+        # Generic: tìm segment /word/{numeric_id}/ đầu tiên
+        # e.g. /fiction/55418/ hoặc /series/123/ hoặc /novel/456/
+        for i, seg in enumerate(segments):
+            if seg.isdigit() and i > 0:
+                story_path = "/" + "/".join(segments[: i + 1]) + "/"
+                return re.escape(story_path)
+
+    except Exception:
+        pass
+    return None
+
+
+def _is_chapter_url(url: str, profile: SiteProfile) -> bool:
+    """
+    Kiểm tra URL có phải chapter URL không.
+    Ưu tiên profile.chapter_url_pattern nếu có (chính xác hơn RE_CHAP_URL).
+    """
+    # Fast path: thử profile pattern trước
+    pattern = profile.get("chapter_url_pattern")
+    if pattern:
+        try:
+            if re.search(pattern, url, re.IGNORECASE):
+                return True
+        except re.error:
+            pass  # Pattern lỗi → fallback RE_CHAP_URL
+
+    # Fallback: regex chung
+    return bool(RE_CHAP_URL.search(url))
+
+
+def _story_id_ok(url: str, progress: ProgressDict) -> bool:
+    if not progress.get("story_id_locked"):
+        return True
+    pattern = progress.get("story_id_regex")
+    if not pattern:
+        return True
+    try:
+        return bool(re.search(pattern, url))
+    except re.error:
+        return True
+
+
 # ── Find start chapter ────────────────────────────────────────────────────────
 
 async def find_start_chapter(
@@ -110,7 +179,12 @@ async def find_start_chapter(
     ai_limiter    : AIRateLimiter,
     profile       : SiteProfile,
 ) -> tuple[str, ProgressDict]:
-    """Xác định URL chapter đầu tiên cần scrape. Resume từ progress nếu có."""
+    """
+    Xác định URL chapter đầu tiên cần scrape. Resume từ progress nếu có.
+
+    Fix #2: Dùng profile.chapter_url_pattern để detect chapter URL chính xác hơn,
+    tránh trường hợp sites có URL format không khớp RE_CHAP_URL (ví dụ slug-only).
+    """
     progress = await load_progress(progress_path)
 
     if progress.get("current_url"):
@@ -127,7 +201,9 @@ async def find_start_chapter(
     soup      = BeautifulSoup(html, "html.parser")
     page_type = detect_page_type(soup, start_url)
 
-    if page_type == "chapter" and RE_CHAP_URL.search(start_url):
+    # Fix #2: dùng _is_chapter_url() thay vì RE_CHAP_URL trực tiếp
+    # → cover sites có chapter_url_pattern đặc biệt không match RE_CHAP_URL
+    if page_type == "chapter" and _is_chapter_url(start_url, profile):
         print(f"  [Start] 📖 Chapter page: {start_url[:70]}", flush=True)
         progress["start_url"] = start_url
         return start_url, progress
@@ -141,7 +217,8 @@ async def find_start_chapter(
 
     result = await ai_classify_and_find(html, start_url, ai_limiter)
     if result:
-        if result.get("page_type") == "chapter" and RE_CHAP_URL.search(start_url):
+        # Fix #2: AI confirm chapter + profile-aware URL check
+        if result.get("page_type") == "chapter" and _is_chapter_url(start_url, profile):
             progress["start_url"] = start_url
             return start_url, progress
         for key in ("first_chapter_url", "next_url"):
@@ -261,6 +338,7 @@ async def scrape_one_chapter(
         print(f"  [End] 🏁 Hết truyện.", flush=True)
         return None
 
+    # Fix #3: story ID guard — chặn URL lạc sang story khác
     if not _story_id_ok(next_url, progress):
         print(f"  [Guard] ⛔ URL bị chặn bởi story ID: {next_url[:60]}", flush=True)
         return None
@@ -300,18 +378,6 @@ async def _find_next_and_save(
     return next_url
 
 
-def _story_id_ok(url: str, progress: ProgressDict) -> bool:
-    if not progress.get("story_id_locked"):
-        return True
-    pattern = progress.get("story_id_regex")
-    if not pattern:
-        return True
-    try:
-        return bool(re.search(pattern, url))
-    except re.error:
-        return True
-
-
 # ── Ads finalization ──────────────────────────────────────────────────────────
 
 async def _finalize_ads(
@@ -333,7 +399,6 @@ async def _finalize_ads(
     domain_slug      = domain.replace(".", "_")
     verified_results : dict[str, bool] = {}
 
-    # ── AI verify (chỉ khi hoàn thành bình thường) ───────────────────────────
     if not cancelled:
         candidates = ads_filter.get_unknown_candidates(min_count=2, max_results=20)
         if candidates:
@@ -343,7 +408,6 @@ async def _finalize_ads(
             )
             try:
                 confirmed = await ai_verify_ads(candidates, domain, ai_limiter)
-                # Ghi kết quả cho review log
                 confirmed_set = set(confirmed)
                 for line in candidates:
                     verified_results[line] = line in confirmed_set
@@ -364,7 +428,6 @@ async def _finalize_ads(
             except Exception as e:
                 logger.warning("[Ads] AI verify thất bại: %s", e)
 
-    # ── Lưu pending review JSON ───────────────────────────────────────────────
     review_path = ads_filter.save_pending_review(
         domain_slug,
         verified_results if verified_results else None,
@@ -385,7 +448,6 @@ async def _finalize_ads(
                 flush=True,
             )
 
-    # ── Lưu ads DB ────────────────────────────────────────────────────────────
     await asyncio.to_thread(ads_filter.save)
     print(f"  [Ads] 💾 {ads_filter.stats} saved", flush=True)
 
@@ -406,10 +468,11 @@ async def run_novel_task(
     Entry point cho một truyện.
 
     Flow:
-      1. Nếu profile chưa có / cũ → chạy Learning Phase (save_profile ghi disk ngay)
+      1. Nếu profile chưa có / cũ → chạy Learning Phase
       2. Reset progress → scrape lại từ đầu với profile đầy đủ
-      3. Full Scrape Mode loop
-      4. finally: luôn chạy _finalize_ads + pm.flush() dù complete/error/Ctrl+C
+      3. Find start chapter + lock story ID (Fix #3)
+      4. Full Scrape Mode loop
+      5. finally: luôn chạy _finalize_ads + pm.flush()
     """
     os.makedirs(output_dir, exist_ok=True)
     domain = urlparse(start_url).netloc.lower()
@@ -419,7 +482,6 @@ async def run_novel_task(
     # ── Phase 1 → 2: Learning (nếu cần) ──────────────────────────────────────
     if not pm.has(domain) or not pm.is_profile_fresh(domain):
         from learning.phase import run_learning_phase
-        # run_learning_phase → pm.save_profile() → ghi disk NGAY
         profile = await run_learning_phase(start_url, pool, pw_pool, pm, ai_limiter)
         if profile is None:
             print(f"  [ERR] Learning Phase thất bại cho {domain}. Bỏ qua.", flush=True)
@@ -460,12 +522,22 @@ async def run_novel_task(
         print(f"  [ERR] Không tìm được điểm bắt đầu: {e}", flush=True)
         return
 
+    # Fix #3: Lock story ID ngay sau khi xác định được start chapter URL.
+    # Chỉ set khi chưa có (tránh override khi resume — đã locked từ lần trước).
+    if not progress.get("story_id_locked"):
+        sid_pattern = _build_story_id_regex(current_url)
+        if sid_pattern:
+            progress["story_id_regex"]  = sid_pattern
+            progress["story_id_locked"] = True
+            await save_progress(progress_path, progress)
+            logger.debug("[StoryID] Locked pattern: %s", sid_pattern)
+
     story_label = progress.get("story_title") or start_url[:50]
     print(f"\n🚀 {story_label}", flush=True)
 
     consecutive_errors   = 0
     consecutive_timeouts = 0
-    _cancelled           = False   # flag cho finally block
+    _cancelled           = False
 
     try:
         while current_url and progress.get("chapter_count", 0) < MAX_CHAPTERS:
@@ -521,18 +593,15 @@ async def run_novel_task(
                     break
 
     finally:
-        # ── Luôn chạy: hoàn thành bình thường / lỗi / Ctrl+C ─────────────────
         total     = progress.get("chapter_count", 0)
         completed = progress.get("completed", False)
         label     = progress.get("story_title") or start_url[:50]
 
-        # Finalize ads (shield bảo vệ khỏi cancel bổ sung)
         try:
             await asyncio.shield(
                 _finalize_ads(ads_filter, domain, ai_limiter, pm, _cancelled)
             )
         except asyncio.CancelledError:
-            # Bị cancel ngay trong lúc finalize → sync save tối thiểu
             try:
                 ads_filter.save_pending_review(domain.replace(".", "_"), None)
                 await asyncio.to_thread(ads_filter.save)
@@ -541,7 +610,6 @@ async def run_novel_task(
         except Exception as e:
             logger.warning("[Finalize] Ads error: %s", e)
 
-        # Flush profile (safety net — save_profile đã ghi ngay, đây chỉ là net)
         try:
             await asyncio.shield(pm.flush())
         except Exception:

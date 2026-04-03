@@ -1,9 +1,8 @@
 """
 learning/profile_manager.py — Quản lý SiteProfile per-domain.
 
-Thay đổi v2:
-  - save_profile(): ghi disk NGAY LẬP TỨC (không chờ flush) → an toàn khi Ctrl+C
-  - add_ads_to_profile(): thêm confirmed keywords vào profile + ghi disk ngay
+Fix #4: add_ads_to_profile() — tính `added` TRƯỚC khi merge vào profile,
+  tránh bug cũ luôn trả về 0 do tính sau khi p["ads_keywords_learned"] đã updated.
 """
 from __future__ import annotations
 
@@ -78,19 +77,27 @@ class ProfileManager:
         """
         Thêm confirmed ads keywords vào profile.ads_keywords_learned + ghi disk ngay.
         Gọi sau khi AI verify xác nhận một keyword là ads thật.
+
+        Fix #4: `added` được tính TRƯỚC khi cập nhật profile (tránh luôn = 0).
         """
         if not keywords:
             return
+
         async with self._lock:
-            p = self._profiles.setdefault(domain, {})  # type: ignore[misc]
+            p        = self._profiles.setdefault(domain, {})  # type: ignore[misc]
             existing = set(p.get("ads_keywords_learned") or [])
             new_kws  = {kw.lower().strip() for kw in keywords if kw.strip()}
-            updated  = sorted(existing | new_kws)
+
+            # Fix #4: tính added TRƯỚC khi merge
+            added   = len(new_kws - existing)
+            updated = sorted(existing | new_kws)
+
             p["ads_keywords_learned"] = updated  # type: ignore[typeddict-unknown-key]
             self._dirty = True
             await save_profiles(self._profiles)
-        added = len(new_kws - set(p.get("ads_keywords_learned", [])))
-        logger.debug("[ProfileManager] +%d ads keywords cho %s", len(new_kws), domain)
+
+        if added > 0:
+            logger.debug("[ProfileManager] +%d ads keywords cho %s", added, domain)
 
     async def update_field(self, domain: str, key: str, value) -> None:
         """Cập nhật một field trong profile (lazy — chờ flush)."""
