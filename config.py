@@ -34,9 +34,15 @@ PROFILES_FILE = os.path.join(DATA_DIR, "site_profiles.json")
 ADS_DB_FILE   = os.path.join(DATA_DIR, "ads_keywords.json")
 
 # ── Learning phase ────────────────────────────────────────────────────────────
-LEARNING_CHAPTERS    = 5    # Số chương dùng để học
+LEARNING_CHAPTERS    = 10   # Số chương fetch để học (tăng từ 5 → 10)
 LEARNING_MIN_CONTENT = 300  # Chars tối thiểu để content hợp lệ
 PROFILE_MAX_AGE_DAYS = 30   # Re-learn nếu profile cũ hơn N ngày
+
+# Số AI calls trong learning phase
+LEARNING_AI_CALLS = 10
+
+# Ngưỡng conflict: nếu 2 AI độc lập disagree trên >= N fields → flag uncertain
+LEARNING_CONFLICT_THRESHOLD = 3
 
 # ── AI ────────────────────────────────────────────────────────────────────────
 AI_MAX_RPM = 10

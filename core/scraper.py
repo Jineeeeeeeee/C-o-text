@@ -1,14 +1,14 @@
 """
-core/scraper.py — v16: Empty streak guard + IssueReporter integration.
+core/scraper.py — v17: 10-call learning phase + title_selector protection.
 
-Thay đổi so với v15:
-  EMPTY-1: consecutive_empty counter trong vòng lặp chính.
-           Sau MAX_EMPTY_STREAK (5) chương liên tiếp 0 ký tự → lưu progress → break.
-           Lần sau chạy lại resume đúng chỗ (không cào lại từ đầu).
-  ISSUE-1: IssueReporter được khởi tạo trong run_novel_task.
-           5 loại issue được báo cáo real-time vào issues.md.
-  ISSUE-2: mark_chapter_ok() gọi sau mỗi chương thành công.
-  ISSUE-3: summarize() gọi trong finally block.
+Thay đổi so với v16:
+  LEARN-1: run_learning_phase() giờ trả về 3-tuple:
+           (profile, sample_titles, fetched_chapters)
+           fetched_chapters được tái dùng → không fetch lại 10 chapters đầu.
+  TITLE-1: prepare_soup() nhận thêm title_selector để bảo vệ h1/title
+           khỏi bị xóa nhầm bởi remove_selectors (fix RoyalRoad bug).
+  TITLE-2: profile["title_selector"] thay vì profile["chapter_title_selector"]
+           trong extractor — normalize field name.
 """
 from __future__ import annotations
 
@@ -42,16 +42,11 @@ from ai.agents            import ai_classify_and_find, ai_find_first_chapter
 
 logger = logging.getLogger(__name__)
 
-# ── Ads finalization tiers ────────────────────────────────────────────────────
 _ADS_AUTO_THRESHOLD = 10
 _ADS_AI_MIN_COUNT   = 3
 _ADS_FREQ_MIN_FILES = 5
+MAX_EMPTY_STREAK    = 5
 
-# ── Empty streak guard ────────────────────────────────────────────────────────
-MAX_EMPTY_STREAK = 5   # Dừng sau N chương liên tiếp không có nội dung
-
-
-# ── Domain tag helper ─────────────────────────────────────────────────────────
 
 def _dtag(url_or_domain: str) -> str:
     if url_or_domain.startswith("http"):
@@ -61,8 +56,6 @@ def _dtag(url_or_domain: str) -> str:
     name = netloc.replace("www.", "").split(".")[0]
     return f"{name[:12]:<12}"
 
-
-# ── Story title extractor ─────────────────────────────────────────────────────
 
 _CHAPTER_TITLE_RE = re.compile(
     r"^\s*(?:chapter|chap|ch|episode|ep|part|chuong|phan)\b[\s.\-:]*\d*",
@@ -92,19 +85,17 @@ def _extract_story_title(raw_page_title: str) -> str | None:
     return max(candidates, key=len)
 
 
-# ── Chapter filename formatter ─────────────────────────────────────────────────
-
 _RE_PIPE_SUFFIX = re.compile(r"\s*\|.*$")
 
 
 def _format_chapter_filename(
-    chapter_num : int,
-    raw_title   : str,
-    progress    : ProgressDict,
+    chapter_num: int,
+    raw_title  : str,
+    progress   : ProgressDict,
 ) -> str:
-    chapter_kw   = (progress.get("chapter_keyword") or "Chapter").strip()
-    has_subtitle  = bool(progress.get("has_chapter_subtitle", False))
-    prefix_strip  = (progress.get("story_prefix_strip") or "").strip()
+    chapter_kw  = (progress.get("chapter_keyword") or "Chapter").strip()
+    has_subtitle = bool(progress.get("has_chapter_subtitle", False))
+    prefix_strip = (progress.get("story_prefix_strip") or "").strip()
 
     title = raw_title.strip()
     if prefix_strip:
@@ -125,7 +116,6 @@ def _format_chapter_filename(
         sub_raw = m.group("sub").strip(" -–—:[]().")
         sub_raw = _RE_PIPE_SUFFIX.sub("", sub_raw).strip()
         chap_id = f"{chapter_kw}{n}"
-
         if has_subtitle and sub_raw and len(sub_raw) >= 2:
             sub_safe = slugify_filename(sub_raw, max_len=50)
             name = f"{chapter_num:04d}_{chap_id}_{sub_safe}"
@@ -137,8 +127,6 @@ def _format_chapter_filename(
 
     return slugify_filename(name, max_len=120) + ".md"
 
-
-# ── Nav-edge strip ────────────────────────────────────────────────────────────
 
 _RE_WORD_COUNT = re.compile(
     r"^\[\s*[\d,.\s]+words?\s*\]$|^\[\s*\.+\s*words?\s*\]$",
@@ -194,16 +182,12 @@ def _strip_nav_edges(text: str) -> str:
     return "\n".join(lines[start:end]) if start < end else text
 
 
-# ── Story ID guard ────────────────────────────────────────────────────────────
-
 def _build_story_id_regex(url: str) -> str | None:
     try:
         path     = urlparse(url).path
         segments = [s for s in path.split("/") if s]
-
         if len(segments) >= 3 and segments[0] == "s" and segments[1].isdigit():
             return re.escape(f"/s/{segments[1]}/")
-
         for i, seg in enumerate(segments):
             if seg.isdigit() and i > 0:
                 story_path = "/" + "/".join(segments[: i + 1]) + "/"
@@ -235,8 +219,6 @@ def _story_id_ok(url: str, progress: ProgressDict) -> bool:
     except re.error:
         return True
 
-
-# ── Find start chapter ────────────────────────────────────────────────────────
 
 async def find_start_chapter(
     start_url     : str,
@@ -292,19 +274,19 @@ async def find_start_chapter(
     raise RuntimeError(f"Không tìm được điểm bắt đầu: {start_url}")
 
 
-# ── Scrape one chapter ────────────────────────────────────────────────────────
-
 async def scrape_one_chapter(
-    url          : str,
-    progress     : ProgressDict,
-    progress_path: str,
-    output_dir   : str,
-    pool         : DomainSessionPool,
-    pw_pool      : PlaywrightPool,
-    profile      : SiteProfile,
-    ai_limiter   : AIRateLimiter,
-    ads_filter   : AdsFilter,
+    url           : str,
+    progress      : ProgressDict,
+    progress_path : str,
+    output_dir    : str,
+    pool          : DomainSessionPool,
+    pw_pool       : PlaywrightPool,
+    profile       : SiteProfile,
+    ai_limiter    : AIRateLimiter,
+    ads_filter    : AdsFilter,
     issue_reporter: IssueReporter,
+    # LEARN-1: Pre-fetched HTML từ learning phase (tránh fetch lại)
+    prefetched_html: str | None = None,
 ) -> str | None:
     tag          = _dtag(url)
     all_visited  : set[str] = set(progress.get("all_visited_urls") or [])
@@ -316,31 +298,33 @@ async def scrape_one_chapter(
             issue_reporter=issue_reporter,
         )
 
-    try:
-        status, html = await fetch_page(url, pool, pw_pool)
-    except Exception as e:
-        # ISSUE: BLOCKED — fetch thất bại hoàn toàn
-        err_msg = str(e)
-        ch_num  = progress.get("chapter_count", 0) + 1
-        if any(kw in err_msg.lower() for kw in ("403", "captcha", "cloudflare", "blocked")):
-            issue_reporter.report("BLOCKED", url, detail=err_msg[:120], chapter_num=ch_num)
-        raise
+    # LEARN-1: Dùng pre-fetched HTML nếu có, không fetch lại
+    if prefetched_html is not None:
+        html   = prefetched_html
+        status = 200
+    else:
+        try:
+            status, html = await fetch_page(url, pool, pw_pool)
+        except Exception as e:
+            err_msg = str(e)
+            ch_num  = progress.get("chapter_count", 0) + 1
+            if any(kw in err_msg.lower() for kw in ("403", "captcha", "cloudflare", "blocked")):
+                issue_reporter.report("BLOCKED", url, detail=err_msg[:120], chapter_num=ch_num)
+            raise
 
     if is_junk_page(html, status):
         if status in (403, 429):
             ch_num = progress.get("chapter_count", 0) + 1
-            issue_reporter.report(
-                "BLOCKED", url,
-                detail=f"HTTP {status}",
-                chapter_num=ch_num,
-            )
+            issue_reporter.report("BLOCKED", url, detail=f"HTTP {status}", chapter_num=ch_num)
         print(f"  [{tag}] 🏁 Hết truyện / junk page", flush=True)
         return None
 
+    # TITLE-1: Pass title_selector vào prepare_soup để bảo vệ title element
     soup = await asyncio.to_thread(
         prepare_soup, html,
         profile.get("remove_selectors"),
         profile.get("content_selector"),
+        profile.get("title_selector"),   # ← MỚI: title protection
     )
 
     if not RE_CHAP_URL.search(url):
@@ -354,13 +338,12 @@ async def scrape_one_chapter(
 
     content, title, selector = await asyncio.to_thread(extract_chapter, soup, url, profile)
 
-    # ISSUE: CONTENT_SUSPICIOUS — selector không lấy được nội dung
     if not content or len(content.strip()) < 100:
         ch_hint = progress.get("chapter_count", 0) + 1
         if selector is None:
             issue_reporter.report(
                 "CONTENT_SUSPICIOUS", url,
-                detail="content_selector returned 0 chars — selector may be wrong",
+                detail="content_selector returned 0 chars",
                 chapter_num=ch_hint,
             )
         print(f"  [{tag}] ⏭  #{ch_hint:>4}: 0 chars — {truncate(url, 52)}", flush=True)
@@ -373,28 +356,21 @@ async def scrape_one_chapter(
     if stripped and len(stripped.strip()) >= 100:
         content = stripped
 
-    # ── ISSUE: TITLE_FALLBACK — title trích từ URL thay vì selector ──────
-    if title and title.startswith("Chapter ") and selector and "title" not in selector:
-        # Heuristic: nếu title trông như URL fallback (chỉ "Chapter N") và
-        # profile có title_selector nhưng không dùng → báo cáo
-        if re.fullmatch(r"Chapter \d+", title):
-            issue_reporter.report(
-                "TITLE_FALLBACK", url,
-                detail=f"Title extracted as '{title}' — may be URL slug fallback",
-                chapter_num=progress.get("chapter_count", 0) + 1,
-            )
+    if title and re.fullmatch(r"Chapter \d+", title):
+        issue_reporter.report(
+            "TITLE_FALLBACK", url,
+            detail=f"Title extracted as '{title}' — may be URL slug fallback",
+            chapter_num=progress.get("chapter_count", 0) + 1,
+        )
 
-    # ── Xóa confirmed ads (real-time) ─────────────────────────────────────
     content = ads_filter.filter(content, chapter_url=url)
 
-    # ── Fingerprint dedup ─────────────────────────────────────────────────
     fp = make_fingerprint(content)
     if fp in fingerprints:
         print(f"  [{tag}] ♻  Loop nội dung — dừng", flush=True)
         return None
     fingerprints.add(fp)
 
-    # Fallback story_title
     if not progress.get("story_title") and not progress.get("story_name_clean"):
         if progress.get("chapter_count", 0) == 0:
             title_tag = soup.find("title")
@@ -404,20 +380,17 @@ async def scrape_one_chapter(
                 if story_candidate:
                     progress["story_title"] = normalize_title(story_candidate)
 
-    # ── Save chapter file ──────────────────────────────────────────────────
     chapter_num = progress.get("chapter_count", 0) + 1
     filename    = _format_chapter_filename(chapter_num, title, progress)
     filepath    = os.path.join(output_dir, filename)
     await write_markdown(filepath, f"# {title}\n\n{content}\n")
 
-    # ── Scan edges cho watermarks MỚI (sau khi save) ──────────────────────
     ads_filter.scan_edges_for_suspects(
         content,
         chapter_url  = url,
         chapter_file = filepath,
     )
 
-    # ── Update progress ────────────────────────────────────────────────────
     progress["chapter_count"]    = chapter_num
     progress["last_title"]       = title
     progress["last_scraped_url"] = url
@@ -431,10 +404,8 @@ async def scrape_one_chapter(
         flush=True,
     )
 
-    # Mark chapter ok cho IssueReporter stats
     issue_reporter.mark_chapter_ok()
 
-    # ── ISSUE: NEXT_URL_MISSING ───────────────────────────────────────────
     next_url = find_next_url(soup, url, profile)
     if not next_url:
         try:
@@ -447,7 +418,7 @@ async def scrape_one_chapter(
     if not next_url:
         issue_reporter.report(
             "NEXT_URL_MISSING", url,
-            detail="Heuristic + AI fallback both failed to find next chapter URL",
+            detail="Heuristic + AI fallback both failed",
             chapter_num=chapter_num,
         )
         progress["completed"]        = True
@@ -471,10 +442,7 @@ async def scrape_one_chapter(
 
 async def _find_next_and_save(
     url, progress, progress_path, pool, pw_pool, profile, ai_limiter,
-    *,
-    soup: BeautifulSoup | None = None,
-    html: str | None = None,
-    issue_reporter: IssueReporter | None = None,
+    *, soup=None, html=None, issue_reporter=None,
 ) -> str | None:
     if soup is None or html is None:
         try:
@@ -493,10 +461,7 @@ async def _find_next_and_save(
             pass
 
     if not next_url and issue_reporter:
-        issue_reporter.report(
-            "NEXT_URL_MISSING", url,
-            detail="Could not find next URL on empty-content chapter",
-        )
+        issue_reporter.report("NEXT_URL_MISSING", url, detail="Empty-content chapter")
 
     if next_url:
         all_visited = set(progress.get("all_visited_urls") or [])
@@ -507,15 +472,13 @@ async def _find_next_and_save(
     return next_url
 
 
-# ── Ads finalization ──────────────────────────────────────────────────────────
-
 async def _finalize_ads(
-    ads_filter : AdsFilter,
-    domain     : str,
-    ai_limiter : AIRateLimiter,
-    pm         : ProfileManager,
-    output_dir : str,
-    cancelled  : bool,
+    ads_filter: AdsFilter,
+    domain    : str,
+    ai_limiter: AIRateLimiter,
+    pm        : ProfileManager,
+    output_dir: str,
+    cancelled : bool,
 ) -> None:
     from ai.agents import ai_verify_ads
 
@@ -533,106 +496,41 @@ async def _finalize_ads(
         for line in auto_candidates:
             verified_results[line] = True
         if added > 0:
-            print(
-                f"  [Ads] 🔒 +{added} auto-learned "
-                f"(≥{_ADS_AUTO_THRESHOLD}× session_log) | {ads_filter.stats}",
-                flush=True,
-            )
+            print(f"  [Ads] 🔒 +{added} auto-learned | {ads_filter.stats}", flush=True)
             await pm.add_ads_to_profile(domain, auto_candidates)
 
     new_suspect_lines = ads_filter.get_new_frequency_suspects(
-        min_files   = _ADS_FREQ_MIN_FILES,
-        max_results = 20,
+        min_files=_ADS_FREQ_MIN_FILES, max_results=20,
     )
-
     all_for_ai      = list(dict.fromkeys(ai_candidates + new_suspect_lines))
     new_suspect_set = set(new_suspect_lines)
 
     if not cancelled and all_for_ai:
-        b_count = len(ai_candidates)
-        c_count = len(new_suspect_lines)
-        print(
-            f"  [Ads] 🤖 AI xác nhận {len(all_for_ai)} dòng "
-            f"({b_count} session_log + {c_count} freq-new)...",
-            flush=True,
-        )
+        print(f"  [Ads] 🤖 AI xác nhận {len(all_for_ai)} dòng...", flush=True)
         try:
             confirmed     = await ai_verify_ads(all_for_ai, domain, ai_limiter)
             confirmed_set = set(confirmed)
-
             for line in all_for_ai:
                 verified_results[line] = line in confirmed_set
-
             if confirmed:
-                added = ads_filter.apply_verified(confirmed)
-
+                ads_filter.apply_verified(confirmed)
                 confirmed_new = [l for l in confirmed if l in new_suspect_set]
-                confirmed_b   = [l for l in confirmed if l not in new_suspect_set]
-
-                if confirmed_b:
-                    print(f"  [Ads] ✅ +{len(confirmed_b)} keyword từ session_log", flush=True)
-
                 if confirmed_new:
-                    print(
-                        f"  [Ads] 🔍 {len(confirmed_new)} new watermarks → "
-                        f"xóa retroactively từ files...",
-                        flush=True,
-                    )
                     removed_count = await asyncio.to_thread(
-                        AdsFilter.post_process_directory,
-                        confirmed_new,
-                        output_dir,
+                        AdsFilter.post_process_directory, confirmed_new, output_dir,
                     )
                     if removed_count > 0:
-                        print(
-                            f"  [Ads] ✅ Đã xóa {removed_count} dòng từ files "
-                            f"| {ads_filter.stats}",
-                            flush=True,
-                        )
-
-                if added > 0:
-                    await pm.add_ads_to_profile(domain, confirmed)
-
-                fp_n = len(all_for_ai) - len(confirmed)
-                if fp_n > 0:
-                    print(f"  [Ads] ℹ️  {fp_n} false positive — giữ nguyên", flush=True)
-            else:
-                print(f"  [Ads] ℹ️  AI: 0 keyword mới được xác nhận", flush=True)
-
+                        print(f"  [Ads] ✅ Đã xóa {removed_count} dòng từ files", flush=True)
+                await pm.add_ads_to_profile(domain, confirmed)
         except asyncio.CancelledError:
             raise
         except Exception as e:
             logger.warning("[Ads] AI verify thất bại: %s", e)
 
-    elif cancelled and all_for_ai:
-        print(
-            f"  [Ads] 🛑 Cancelled — bỏ qua AI verify "
-            f"({len(all_for_ai)} candidates chưa xác nhận)",
-            flush=True,
-        )
-
-    review_path = ads_filter.save_pending_review(
-        domain_slug,
-        verified_results if verified_results else None,
-    )
-    if review_path:
-        summary     = ads_filter.get_session_summary()
-        total       = len(summary)
-        confirmed_n = sum(1 for v in verified_results.values() if v)
-        icon        = "🛑" if cancelled else "📋"
-        print(
-            f"  [Ads] {icon} {total} dòng đã lọc"
-            + (f" | {confirmed_n} xác nhận" if confirmed_n else "")
-            + f" | {len(new_suspect_lines)} freq-suspects"
-            + f" → {review_path}",
-            flush=True,
-        )
-
+    ads_filter.save_pending_review(domain_slug, verified_results or None)
     await asyncio.to_thread(ads_filter.save)
     print(f"  [Ads] 💾 {ads_filter.stats}", flush=True)
 
-
-# ── Main task ─────────────────────────────────────────────────────────────────
 
 async def run_novel_task(
     start_url     : str,
@@ -647,12 +545,15 @@ async def run_novel_task(
     domain = urlparse(start_url).netloc.lower()
     tag    = _dtag(domain)
 
-    actual_output_dir = output_dir
-    ads_filter        = AdsFilter.load(domain=domain)
-    issue_reporter    = IssueReporter(domain=domain)
-    pre_fetched_titles: list[str] = []
+    actual_output_dir  = output_dir
+    ads_filter         = AdsFilter.load(domain=domain)
+    issue_reporter     = IssueReporter(domain=domain)
+    pre_fetched_titles : list[str] = []
 
-    # ── Phase 1 → 2: Learning ────────────────────────────────────────────────
+    # LEARN-1: fetched_chapters từ learning phase — tái dùng, không fetch lại
+    fetched_chapters: list[tuple[str, str]] = []
+
+    # ── Phase 1→2: Learning ───────────────────────────────────────────────────
     if not pm.has(domain) or not pm.is_profile_fresh(domain):
         if os.path.exists(progress_path):
             try:
@@ -667,42 +568,44 @@ async def run_novel_task(
             print(f"  [{tag}] ❌ Learning Phase thất bại. Bỏ qua.", flush=True)
             issue_reporter.report(
                 "LEARNING_FAILED", start_url,
-                detail="run_learning_phase() returned None — AI calls may have failed",
+                detail="run_learning_phase() returned None",
             )
             issue_reporter.summarize(0)
             return
 
-        profile, pre_fetched_titles = result
+        # LEARN-1: Unpack 3-tuple (profile, titles, chapters)
+        profile, pre_fetched_titles, fetched_chapters = result
 
         injected = ads_filter.inject_from_profile(profile)
         if injected > 0:
             print(f"  [{tag}] [Ads] +{injected} từ profile | {ads_filter.stats}", flush=True)
 
-        print(f"\n  [{tag}] 🔄 Reset progress → scrape lại từ Ch.1...\n", flush=True)
+        print(f"\n  [{tag}] 🔄 Tái dùng {len(fetched_chapters)} chapters đã fetch...\n", flush=True)
         await save_progress(progress_path, {
-            "current_url"        : None,
-            "chapter_count"      : 0,
-            "story_title"        : None,
-            "all_visited_urls"   : [],
-            "fingerprints"       : [],
-            "story_id"           : None,
-            "story_id_regex"     : None,
-            "story_id_locked"    : False,
-            "completed"          : False,
-            "completed_at_url"   : None,
-            "learning_done"      : True,
-            "start_url"          : start_url,
-            "naming_done"        : False,
-            "story_name_clean"   : None,
-            "chapter_keyword"    : None,
+            "current_url"         : None,
+            "chapter_count"       : 0,
+            "story_title"         : None,
+            "all_visited_urls"    : [],
+            "fingerprints"        : [],
+            "story_id"            : None,
+            "story_id_regex"      : None,
+            "story_id_locked"     : False,
+            "completed"           : False,
+            "completed_at_url"    : None,
+            "learning_done"       : True,
+            "start_url"           : start_url,
+            "naming_done"         : False,
+            "story_name_clean"    : None,
+            "chapter_keyword"     : None,
             "has_chapter_subtitle": False,
-            "story_prefix_strip" : None,
-            "output_dir_final"   : None,
+            "story_prefix_strip"  : None,
+            "output_dir_final"    : None,
         })
     else:
         print(f"  [{tag}] 📂 {pm.summary(domain)}", flush=True)
         profile            = pm.get(domain)
         pre_fetched_titles = []
+        fetched_chapters   = []
         injected = ads_filter.inject_from_profile(profile)
         if injected > 0:
             print(f"  [{tag}] [Ads] +{injected} từ profile | {ads_filter.stats}", flush=True)
@@ -733,7 +636,6 @@ async def run_novel_task(
         progress["naming_done"] = True
         await save_progress(progress_path, progress)
 
-    # Story ID lock
     if not progress.get("story_id_locked"):
         sid_pattern = _build_story_id_regex(current_url)
         if sid_pattern:
@@ -741,7 +643,6 @@ async def run_novel_task(
             progress["story_id_locked"] = True
             await save_progress(progress_path, progress)
 
-    # Xác định actual output dir
     actual_output_dir = progress.get("output_dir_final") or output_dir
     os.makedirs(actual_output_dir, exist_ok=True)
 
@@ -750,17 +651,18 @@ async def run_novel_task(
         or progress.get("story_title")
         or urlparse(start_url).netloc
     )
-
-    # Cập nhật story label cho IssueReporter
     issue_reporter.set_story_label(story_label)
 
     print(f"\n{'─'*62}", flush=True)
     print(f"  🚀 [{tag}] {story_label}", flush=True)
     print(f"{'─'*62}", flush=True)
 
+    # LEARN-1: Build map url→html từ fetched_chapters để tái dùng
+    prefetch_map: dict[str, str] = {url: html for url, html in fetched_chapters}
+
     consecutive_errors   = 0
     consecutive_timeouts = 0
-    consecutive_empty    = 0   # EMPTY-1: counter chương trống liên tiếp
+    consecutive_empty    = 0
     _cancelled           = False
 
     try:
@@ -772,49 +674,44 @@ async def run_novel_task(
 
             try:
                 prev_count = progress.get("chapter_count", 0)
-                next_url   = await scrape_one_chapter(
-                    url            = current_url,
-                    progress       = progress,
-                    progress_path  = progress_path,
-                    output_dir     = actual_output_dir,
-                    pool           = pool,
-                    pw_pool        = pw_pool,
-                    profile        = profile,
-                    ai_limiter     = ai_limiter,
-                    ads_filter     = ads_filter,
-                    issue_reporter = issue_reporter,
+
+                # LEARN-1: Dùng pre-fetched HTML nếu có cho chapter này
+                prefetched = prefetch_map.pop(current_url, None)
+
+                next_url = await scrape_one_chapter(
+                    url             = current_url,
+                    progress        = progress,
+                    progress_path   = progress_path,
+                    output_dir      = actual_output_dir,
+                    pool            = pool,
+                    pw_pool         = pw_pool,
+                    profile         = profile,
+                    ai_limiter      = ai_limiter,
+                    ads_filter      = ads_filter,
+                    issue_reporter  = issue_reporter,
+                    prefetched_html = prefetched,
                 )
                 consecutive_errors   = 0
                 consecutive_timeouts = 0
 
                 new_count = progress.get("chapter_count", 0)
-
                 if new_count > prev_count:
-                    # Chương có nội dung → reset empty counter
                     consecutive_empty = 0
                     if on_chapter_done:
                         await on_chapter_done()
                 else:
-                    # Chương không có nội dung (0 ký tự hoặc bị skip)
                     consecutive_empty += 1
                     if consecutive_empty >= MAX_EMPTY_STREAK:
-                        # EMPTY-1: Đủ N chương trống → tạm dừng
                         print(
                             f"\n  [{tag}] ⏸  Tạm dừng: {MAX_EMPTY_STREAK} chương "
-                            f"liên tiếp không có nội dung.\n"
-                            f"           Chạy lại để tiếp tục khi có chương mới.",
+                            f"liên tiếp không có nội dung.",
                             flush=True,
                         )
                         issue_reporter.report(
-                            "EMPTY_STREAK",
-                            current_url,
-                            detail=(
-                                f"{MAX_EMPTY_STREAK} consecutive chapters with no content. "
-                                f"Author may not have published yet."
-                            ),
+                            "EMPTY_STREAK", current_url,
+                            detail=f"{MAX_EMPTY_STREAK} consecutive empty chapters.",
                             chapter_num=progress.get("chapter_count", 0) + 1,
                         )
-                        # Lưu progress để resume đúng chỗ lần sau
                         await save_progress(progress_path, progress)
                         break
 
@@ -850,7 +747,6 @@ async def run_novel_task(
         completed = progress.get("completed", False)
         label     = progress.get("story_name_clean") or progress.get("story_title") or start_url[:50]
 
-        # IssueReporter summary
         issue_reporter.summarize(total)
 
         try:

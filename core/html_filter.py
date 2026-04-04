@@ -7,12 +7,22 @@ Pipeline:
   2. strip_noise_tags: xóa script/style/noscript/iframe/svg...
   3. remove_hidden_elements: xóa hidden attr, aria-hidden, CSS display:none
   4. remove_profile_selectors: xóa elements theo remove_selectors từ profile
-     ⚠ Bỏ qua nếu:
-       - element LÀ content_selector (el is content_el)
-       - element nằm BÊN TRONG content_selector (content_el in el.parents)
-       - element là TỔ TIÊN của content_selector (el in content_el.parents)  ← FIX
-     → Tránh trường hợp remove_selectors như "div#content_parent" xóa luôn
-       wrapper chứa content, kéo theo toàn bộ nội dung bị mất (fanfiction bug).
+
+FIX v2: Bảo vệ CÙNG LÚC content_selector VÀ title_selector.
+  Không xóa bất kỳ element nào nếu nó:
+    (a) IS content_el hoặc title_el
+    (b) LÀ TỔ TIÊN của content_el hoặc title_el
+        → xóa ancestor sẽ kéo theo toàn bộ nội dung / title bên trong
+
+  Ví dụ RoyalRoad:
+    remove_selectors = ["div.text-center"]
+    title_selector   = "h1"
+    → h1 nằm trong div.text-center
+    → div.text-center là ANCESTOR của h1
+    → KHÔNG xóa div.text-center (bảo vệ title)
+
+  Elements CON CHÁU của content_el / title_el vẫn bị xóa bình thường,
+  cho phép remove_selectors loại bỏ ads/nav nằm bên trong content area.
 """
 from __future__ import annotations
 
@@ -60,9 +70,10 @@ _CSS_HIDDEN_RULE_RE = re.compile(
 
 
 def prepare_soup(
-    html: str,
-    remove_selectors: list[str] | None = None,
-    content_selector: str | None = None,
+    html             : str,
+    remove_selectors : list[str] | None = None,
+    content_selector : str | None = None,
+    title_selector   : str | None = None,
 ) -> BeautifulSoup:
     """
     Parse HTML và chạy full cleaning pipeline.
@@ -70,12 +81,16 @@ def prepare_soup(
     Args:
         html:              Raw HTML string
         remove_selectors:  CSS selectors từ profile để xóa (VD: [".ads", ".donate-btn"])
-        content_selector:  CSS selector của content area. Hai trường hợp được bảo vệ:
-                       (a) el chính là content_el — không xóa chính nó.
-                       (b) el là TỔ TIÊN của content_el — xóa el sẽ phá hủy content.
-                       Các element BÊN TRONG content_el (con cháu) vẫn bị xóa bình thường,
-                       cho phép remove_selectors loại bỏ nav/ads nằm trong content area.
+        content_selector:  CSS selector của content area — được bảo vệ khỏi bị xóa.
+        title_selector:    CSS selector của chapter title — được bảo vệ khỏi bị xóa.
+                           FIX v2: title_selector protection ngăn bug "h1 bị xóa cùng
+                           với div.text-center" như đã xảy ra trên RoyalRoad.
 
+    Protection logic:
+        Một element BỊ BỎ QUA (không xóa) nếu:
+          - el IS content_el hoặc title_el
+          - el LÀ TỔ TIÊN của content_el hoặc title_el
+        Elements CON CHÁU của protected elements vẫn bị xóa bình thường.
 
     Returns:
         Cleaned BeautifulSoup object
@@ -98,28 +113,45 @@ def prepare_soup(
             el.decompose()
 
     # Bước 4: Xóa profile-specified selectors
-    # ── QUAN TRỌNG: 3 trường hợp cần bảo vệ ─────────────────────────────────
-    # (a) el IS content_el → không xóa chính content
-    # (b) content_el in el.parents → el là con cháu của content_el (thực ra
-    #     điều này không xảy ra vì ta đang xóa el; nhưng giữ để tương thích)
-    # (c) el in content_el.parents → el là TỔ TIÊN của content_el
-    #     VD: remove_selectors = ["div#content_parent"], content = "#storytext"
-    #     → div#content_parent là tổ tiên của #storytext → KHÔNG xóa
+    # ── Xây dựng tập protected elements ──────────────────────────────────────
+    # Protected = chính content_el, chính title_el, và TỔ TIÊN của cả hai.
+    # "Tổ tiên" nghĩa là: nếu xóa element này thì title/content bị mất theo.
     if remove_selectors:
-        content_el: Tag | None = None
-        if content_selector:
-            try:
-                content_el = soup.select_one(content_selector)
-            except Exception:
-                pass
+        protected: set[Tag] = set()
 
+        for sel, label in (
+            (content_selector, "content"),
+            (title_selector,   "title"),
+        ):
+            if not sel:
+                continue
+            try:
+                # Lấy TẤT CẢ matches (không chỉ select_one)
+                # vì title_selector có thể match nhiều h1
+                matched_els = soup.select(sel)
+                for target_el in matched_els:
+                    # Bảo vệ chính nó
+                    protected.add(target_el)
+                    # Bảo vệ tất cả tổ tiên của nó
+                    for ancestor in target_el.parents:
+                        if isinstance(ancestor, Tag):
+                            protected.add(ancestor)
+            except Exception as exc:
+                logger.debug(
+                    "[html_filter] Không resolve được %s selector %r: %s",
+                    label, sel, exc,
+                )
+
+        # Apply remove_selectors, skip protected elements
         for sel in remove_selectors:
             try:
                 for el in list(soup.select(sel)):
-                    if content_el is not None and (
-                        el is content_el             # (a) el chính là content → không xóa
-                        or el in content_el.parents  # (b) el là TỔ TIÊN của content → xóa sẽ kéo theo content
-                    ):
+                    if el in protected:
+                        logger.debug(
+                            "[html_filter] SKIP remove %r — protected "
+                            "(chứa title/content)",
+                            sel,
+                        )
                         continue
                     el.decompose()
             except Exception:

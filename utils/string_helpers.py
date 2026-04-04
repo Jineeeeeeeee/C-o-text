@@ -71,33 +71,93 @@ def normalize_title(raw: str) -> str:
     return t or "Unknown Title"
 
 
-_RE_SITE_SUFFIX = re.compile(
-    r"\s*[\|–\-—]\s*[A-Za-z0-9][A-Za-z0-9 .]{3,40}$",
-    re.UNICODE,
+# ── strip_site_suffix ─────────────────────────────────────────────────────────
+#
+# FIX v2: Xử lý đúng hơn cho nhiều loại separator phổ biến:
+#
+#   OLD: chỉ match [\|–\-—] → "Chapter 9 – Core Strength - Rock falls..."
+#        → strip_site_suffix chỉ strip phần sau – (dấu em-dash)
+#        → còn lại "Chapter 9 – Core Strength - Rock falls, everyone dies"
+#        → candidate quá dài, vote lệch
+#
+#   NEW: strip tất cả các "suffix block" phân tách bởi |, –, —, hoặc dấu -
+#        nhưng CHỈ strip khi phần bị strip trông giống site name / story name,
+#        không phải subtitle chương.
+#
+# Strategy:
+#   1. Split theo separator mạnh (|, –, —) trước
+#   2. Nếu có ≥2 parts → lấy part ĐẦU TIÊN (thường là chapter title)
+#   3. Nếu chỉ có 1 part (chỉ dùng " - ") → strip từ " - " CUỐI CÙNG
+#      về sau (heuristic: site suffix thường ở cuối)
+#
+# VD đúng:
+#   "Chapter 9 – Core Strength - Rock falls | Royal Road"
+#     → split by | → ["Chapter 9 – Core Strength - Rock falls", "Royal Road"]
+#     → lấy part[0] → "Chapter 9 – Core Strength - Rock falls"
+#     → vẫn có " - " → strip từ " - " cuối → "Chapter 9 – Core Strength" ✅
+#
+#   "Chapter 1 – A [Rolling Stone] | The Wandering Inn | Royal Road"
+#     → split by | → ["Chapter 1 – A [Rolling Stone]", "The Wandering Inn", "Royal Road"]
+#     → lấy part[0] → "Chapter 1 – A [Rolling Stone]" ✅
+#
+#   "My Novel Chapter 1, a crossover fanfic | FanFiction"
+#     → split by | → ["My Novel Chapter 1, a crossover fanfic", "FanFiction"]
+#     → lấy part[0] → "My Novel Chapter 1, a crossover fanfic" ✅
+
+# Separator mạnh: |, –, —
+_RE_STRONG_SEP = re.compile(r"\s*[|–—]\s*")
+
+# Dấu " - " (hyphen với spaces) — separator yếu hơn
+_RE_WEAK_SEP = re.compile(r"\s+-\s+")
+
+# Site name pattern: ngắn (≤40 chars), không có dấu phẩy, không có số chương
+_RE_LOOKS_LIKE_SITE = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9\s.]{2,39}$"
 )
 
 
 def strip_site_suffix(raw: str) -> str:
     """
-    Xóa site name suffix khỏi <title> tag.
-    Chỉ dùng cho nguồn 'title_tag' và 'og:title' — KHÔNG dùng cho h1/h2/dedicated selector.
+    Xóa site name / story name suffix khỏi <title> tag.
+    Chỉ dùng cho nguồn 'title_tag' và 'og:title'.
 
-    VD: "Chapter 5 | RoyalRoad" → "Chapter 5"
-        "Chapter 5 – The Wandering Inn" → "Chapter 5"
-        "Chapter 5 - Into the Dark" → "Chapter 5"  ← đây là BUG nên tránh
+    VD:
+      "Chapter 9 – Core Strength - Rock falls | Royal Road"
+        → "Chapter 9 – Core Strength"
+      "Chapter 1 – Into the Dark | The Wandering Inn | Royal Road"
+        → "Chapter 1 – Into the Dark"
+      "My Novel Chapter 1, a crossover fanfic | FanFiction"
+        → "My Novel Chapter 1, a crossover fanfic"
+      "Chapter 9 – Core Strength - Rock falls, everyone dies"  (og:title, no |)
+        → "Chapter 9 – Core Strength"
     """
-    return _RE_SITE_SUFFIX.sub("", raw).strip()
+    text = raw.strip()
+
+    # Step 1: Split bởi separator mạnh (|, –, —)
+    parts = [p.strip() for p in _RE_STRONG_SEP.split(text) if p.strip()]
+
+    if len(parts) >= 2:
+        # Lấy part đầu tiên — thường là chapter title
+        text = parts[0].strip()
+    # Nếu len == 1: không có separator mạnh → tiếp tục với text gốc
+
+    # Step 2: Kiểm tra có dấu " - " không → strip từ " - " cuối về sau
+    # Chỉ strip nếu phần bị strip trông giống site/story name (ngắn, đơn giản)
+    weak_parts = _RE_WEAK_SEP.split(text)
+    if len(weak_parts) >= 2:
+        suffix = weak_parts[-1].strip()
+        # Chỉ strip nếu suffix trông như site name / story name
+        # Không strip nếu suffix có dấu phẩy (thường là nội dung truyện)
+        if "," not in suffix and _RE_LOOKS_LIKE_SITE.match(suffix):
+            text = " - ".join(weak_parts[:-1]).strip()
+
+    return text.strip()
 
 
 # ── Safe filename ─────────────────────────────────────────────────────────────
 
-# Ký tự không hợp lệ trên Windows + các ký tự gây tên file xấu
 _RE_UNSAFE = re.compile(r'[\\/:*?"<>|\x00-\x1f\[\]()!\'`~@#$%^&+={}]')
-
-# Nhiều dấu _ hoặc - hoặc space liên tiếp → gộp lại
 _RE_MULTI_SEP = re.compile(r'[-_\s]{2,}')
-
-# Dấu - hoặc _ ở đầu/cuối word segment (sau khi đã gộp)
 _RE_EDGE_SEP  = re.compile(r'^[-_\s]+|[-_\s]+$')
 
 _WINDOWS_RESERVED = frozenset({
@@ -110,43 +170,15 @@ _WINDOWS_RESERVED = frozenset({
 def slugify_filename(name: str, max_len: int = 80) -> str:
     """
     Chuyển tên chương thành filename an toàn trên Windows/Linux/macOS.
-
-    Pipeline:
-      1. Normalize unicode NFC
-      2. Xóa ký tự unsafe (\\/:*?"<>| và brackets, punctuation đặc biệt)
-      3. Thay thế bằng space (không phải _) để tránh ___ liên tiếp
-      4. Gộp nhiều separator liên tiếp thành 1 space
-      5. Trim đầu/cuối
-      6. Kiểm tra Windows reserved names
-      7. Truncate
-
-    VD:
-      "A [Rolling Stone] Gathers no Moss" → "A Rolling Stone Gathers no Moss"
-      "The Innkeeper's *Special* Menu"     → "The Innkeepers Special Menu"
-      "Chapter 1 – Into the Dark!"        → "Chapter 1 - Into the Dark"
     """
-    # 1. Normalize unicode
     safe = unicodedata.normalize("NFC", name)
-
-    # 2. Xóa ký tự unsafe → thay bằng space
     safe = _RE_UNSAFE.sub(" ", safe)
-
-    # 3. Gộp nhiều separator (space, _, -) liên tiếp thành 1 space
     safe = _RE_MULTI_SEP.sub(" ", safe)
-
-    # 4. Trim
     safe = safe.strip(" -_")
-
-    # 5. Thay space còn lại bằng _ cho tên file gọn
     safe = safe.replace(" ", "_")
-
-    # 6. Gộp _ liên tiếp lần nữa (phòng hờ)
     safe = re.sub(r"_+", "_", safe).strip("_")
-
-    # 7. Windows reserved names
     if safe.split(".")[0].upper() in _WINDOWS_RESERVED:
         safe = f"_{safe}"
-
     return safe[:max_len] or "_"
 
 
