@@ -7,7 +7,12 @@ Pipeline:
   2. strip_noise_tags: xóa script/style/noscript/iframe/svg...
   3. remove_hidden_elements: xóa hidden attr, aria-hidden, CSS display:none
   4. remove_profile_selectors: xóa elements theo remove_selectors từ profile
-     ⚠ Bỏ qua nếu element nằm BÊN TRONG content_selector (tránh tự nuking content)
+     ⚠ Bỏ qua nếu:
+       - element LÀ content_selector (el is content_el)
+       - element nằm BÊN TRONG content_selector (content_el in el.parents)
+       - element là TỔ TIÊN của content_selector (el in content_el.parents)  ← FIX
+     → Tránh trường hợp remove_selectors như "div#content_parent" xóa luôn
+       wrapper chứa content, kéo theo toàn bộ nội dung bị mất (fanfiction bug).
 """
 from __future__ import annotations
 
@@ -65,10 +70,10 @@ def prepare_soup(
     Args:
         html:              Raw HTML string
         remove_selectors:  CSS selectors từ profile để xóa (VD: [".ads", ".donate-btn"])
-        content_selector:  CSS selector của content area — các element BÊN TRONG
-                           vùng này sẽ KHÔNG bị xóa bởi remove_selectors.
-                           Ngăn trường hợp AI học selector như "div#storytext > div"
-                           vô tình xóa luôn nội dung truyện.
+        content_selector:  CSS selector của content area — các element BÊN TRONG hoặc
+                           LÀ TỔ TIÊN của vùng này sẽ KHÔNG bị xóa bởi remove_selectors.
+                           Ngăn trường hợp remove_selectors như "div#content_parent" xóa
+                           wrapper bao chứa content (fanfiction.net bug).
 
     Returns:
         Cleaned BeautifulSoup object
@@ -91,7 +96,13 @@ def prepare_soup(
             el.decompose()
 
     # Bước 4: Xóa profile-specified selectors
-    # ── QUAN TRỌNG: bỏ qua nếu element nằm trong content_selector ────────────
+    # ── QUAN TRỌNG: 3 trường hợp cần bảo vệ ─────────────────────────────────
+    # (a) el IS content_el → không xóa chính content
+    # (b) content_el in el.parents → el là con cháu của content_el (thực ra
+    #     điều này không xảy ra vì ta đang xóa el; nhưng giữ để tương thích)
+    # (c) el in content_el.parents → el là TỔ TIÊN của content_el
+    #     VD: remove_selectors = ["div#content_parent"], content = "#storytext"
+    #     → div#content_parent là tổ tiên của #storytext → KHÔNG xóa
     if remove_selectors:
         content_el: Tag | None = None
         if content_selector:
@@ -103,10 +114,10 @@ def prepare_soup(
         for sel in remove_selectors:
             try:
                 for el in list(soup.select(sel)):
-                    # Không xóa content element hoặc element con của nó
                     if content_el is not None and (
-                        el is content_el
-                        or content_el in el.parents
+                        el is content_el                  # (a) chính content
+                        or content_el in el.parents       # (b) el chứa content (redundant nhưng rõ ràng)
+                        or el in content_el.parents       # (c) FIX: el là tổ tiên → KHÔNG xóa
                     ):
                         continue
                     el.decompose()

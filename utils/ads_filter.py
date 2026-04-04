@@ -1,9 +1,11 @@
 """
-utils/ads_filter.py — v4: Lọc watermark/ads + session logging + AI verify + blacklist generic keywords.
+utils/ads_filter.py — v5: Thêm social share CTAs + navigation labels vào global seeds.
 
-Thay đổi so với v3:
-  - add_keywords(): thêm blacklist từ generic/short (search, log in, read, find, chapter, story, etc.)
-  - Tránh học keyword < 8 ký tự hoặc quá rõ ràng là từ story
+Thay đổi so với v4:
+  - _SEED_GLOBAL_KEYWORDS: thêm "share to your friends", "share this chapter",
+    "prev chapter", "next chapter" (nav labels lặp lại) và các social share patterns
+  - _SEED_DOMAIN_KEYWORDS: thêm novelfire.net với share CTAs đặc trưng
+  - add_keywords(): giữ blacklist generic từ v4
 """
 from __future__ import annotations
 
@@ -26,14 +28,35 @@ _ADS_REVIEW_DIR = os.path.join(os.path.dirname(ADS_DB_FILE), "ads_review")
 
 # ── Global keywords ───────────────────────────────────────────────────────────
 _SEED_GLOBAL_KEYWORDS: list[str] = [
+    # Stolen content notices
     "stolen content", "stolen from", "this content is stolen",
     "this chapter is stolen", "has been taken without permission",
+
+    # Author/translation attribution boilerplate
     "please support the author", "support the original",
-    "patreon.com/", "ko-fi.com/",
     "translation by", "mtl by", "machine translated",
     "if you find any errors",
+
+    # Read-at / piracy watermarks
     "read latest chapters at", "read advance chapters at",
     "chapters are updated daily",
+    "read at", "read on", "find this novel at",
+    "visit to read", "originally published at",
+
+    # Donation / monetization CTAs
+    "patreon.com/", "ko-fi.com/",
+
+    # Social share CTAs — phổ biến trên nhiều aggregator sites
+    # VD: novelfire.net "Share to your friends", scribblehub share buttons
+    "share to your friends",
+    "share this chapter",
+    "share this novel",
+    "share this story",
+    "share on facebook", "share on twitter", "share on reddit",
+
+    # Navigation labels lặp lại (xuất hiện ở đầu/cuối chapter do remove_selectors bỏ sót)
+    "previous chapter", "next chapter",
+    "table of contents",
 ]
 
 # ── Per-domain seed keywords ──────────────────────────────────────────────────
@@ -51,6 +74,14 @@ _SEED_DOMAIN_KEYWORDS: dict[str, list[str]] = {
     "webnovel.com": [
         "original at webnovel", "read on webnovel",
     ],
+    # FIX: novelfire.net có "Share to your friends" ở cuối mỗi chương
+    # (đôi khi remove_selectors bỏ sót vì nằm ngoài .chapternav)
+    "novelfire.net": [
+        "share to your friends",
+        "share this chapter",
+        "novelfire.net",
+        "read at novelfire",
+    ],
     "lightnovelreader.me": ["visit lightnovelreader"],
     "novelfull.com"      : ["visit novelfull"],
     "wuxiaworld.com"     : ["visit wuxiaworld"],
@@ -66,6 +97,14 @@ _SEED_PATTERNS_RAW: list[str] = [
     r"pubfuturetag\.push\(",
     r'"unit"\s*:\s*"[^"]+"\s*,\s*"id"\s*:\s*"pf-',
     r"window\.\w+\s*=\s*window\.\w+\s*\|\|\s*\[\]",
+    # Obfuscated Patreon links — tác giả thêm dấu chấm/khoảng trắng để lách lọc
+    # Khớp: "p.a.t.r.e.o.n", "p.a.t.r.e.o.n.c.o.m", "p.a.t.r..eo.n..co.m"
+    r"p[.\s]*a[.\s]*t[.\s]*r[.\s]*e[.\s]*o[.\s]*n",
+    # Obfuscated Boosty (thay thế Patreon phổ biến ở một số cộng đồng)
+    r"b[.\s]*o[.\s]*o[.\s]*s[.\s]*t[.\s]*y",
+    # Generic "read ahead" CTA — dù wording thay đổi, pattern vẫn giống nhau
+    r"read\s+\d+\s+chapter[s]?\s+ahead",
+    r"chapter[s]?\s+ahead\s+(on|at|over)\s+(my\s+)?",
 ]
 
 # FIX: Blacklist từ generic/short để tránh học keywords sai
@@ -74,11 +113,11 @@ _GENERIC_KEYWORD_BLACKLIST: frozenset[str] = frozenset({
     "search", "log in", "login", "read", "find", "chapter", "story",
     "novel", "series", "book", "text", "content", "page", "link", "click",
     "here", "site", "web", "online", "free",
-    
+
     # Từ site được loại trừ (sẽ match cả nội dung)
     "royal road", "royalroad", "fanfiction", "wattpad", "webnovel",
     "scribble", "archive", "ao3",
-    
+
     # Tiêu đề story/tên nhân vật hay bị nhầm
     "the primal hunter", "monster cultivator", "system", "bloodline",
     "realm", "cultivation", "dungeon", "quest", "skill", "class",
@@ -130,7 +169,6 @@ class AdsFilter:
         try:
             with open(ADS_DB_FILE, "r", encoding="utf-8") as f:
                 raw = f.read().strip()
-            # FIX: file rỗng (mới tạo) → bỏ qua, không crash
             if not raw:
                 return instance
             data = json.loads(raw)
@@ -159,15 +197,8 @@ class AdsFilter:
     ) -> tuple[list[str], list[str]]:
         """
         Phân loại unknown candidates theo tần suất xuất hiện:
-
-        - auto_add  (count ≥ auto_threshold): lặp đủ nhiều → thêm trực tiếp,
-          không cần AI xác nhận. Tín hiệu mạnh vì watermark thật thường
-          xuất hiện hầu hết chapters.
-        - ai_verify (min_count ≤ count < auto_threshold): lặp ít → gửi AI
-          phân biệt ads thật vs false positive.
-
-        Cả hai nhóm đều đã loại trừ lines covered bởi keyword hiện tại
-        (substring check giống _is_ads).
+        - auto_add  (count ≥ auto_threshold): thêm trực tiếp
+        - ai_verify (min_count ≤ count < auto_threshold): gửi AI xác nhận
 
         Returns:
             (auto_add, ai_verify)
@@ -269,42 +300,39 @@ class AdsFilter:
     def add_keywords(self, keywords: list[str], to_domain: bool = True) -> int:
         """
         Thêm keywords mới vào domain bucket (default) hoặc global.
-        
-        FIX: Bỏ qua keyword nếu:
-          1. Trong blacklist generic (search, log in, etc.)
+
+        Bỏ qua nếu:
+          1. Trong blacklist generic
           2. Quá short (< 8 ký tự)
-          3. Đã trong global hoặc domain bucket
+          3. Đã tồn tại
         """
         added = 0
         use_domain = to_domain and bool(self._domain)
-        
+
         for kw in keywords:
             if not isinstance(kw, str):
                 continue
             kw_lower = kw.lower().strip()
             if not kw_lower:
                 continue
-            
-            # FIX: Skip blacklist generic keywords
+
             if kw_lower in _GENERIC_KEYWORD_BLACKLIST:
                 logger.debug(f"[AdsFilter] Skip blacklist keyword: {kw_lower!r}")
                 continue
-            
-            # Skip quá short
+
             if len(kw_lower) < 8:
                 logger.debug(f"[AdsFilter] Skip too short keyword: {kw_lower!r}")
                 continue
-            
-            # Skip nếu đã tồn tại
+
             if kw_lower in self._global_keywords or kw_lower in self._domain_keywords:
                 continue
-            
+
             if use_domain:
                 self._domain_keywords.add(kw_lower)
             else:
                 self._global_keywords.add(kw_lower)
             added += 1
-        
+
         return added
 
     # ── Core filtering ────────────────────────────────────────────────────
@@ -319,7 +347,6 @@ class AdsFilter:
 
         for ln in lines:
             stripped = ln.strip()
-            # Chỉ check + log các dòng đủ dài
             if len(stripped) >= _MIN_LINE_LEN and self._is_ads(ln):
                 self._session_log.append({
                     "line"        : stripped,
@@ -364,7 +391,6 @@ class AdsFilter:
     def get_session_summary(self) -> dict[str, dict]:
         """
         Aggregate session log thành: line → {count, urls}.
-        Dùng để biết dòng nào bị filter nhiều nhất và ở chương nào.
         """
         summary: dict[str, dict] = {}
         for entry in self._session_log:
@@ -378,7 +404,7 @@ class AdsFilter:
         return summary
 
     def clear_session_log(self) -> None:
-        """Xóa log phiên hiện tại (dùng khi bắt đầu truyện mới)."""
+        """Xóa log phiên hiện tại."""
         self._session_log.clear()
 
     def get_unknown_candidates(
@@ -388,15 +414,7 @@ class AdsFilter:
     ) -> list[str]:
         """
         Trả về top N dòng bị filter mà CHƯA được cover bởi keyword đã biết.
-        Dùng để gửi AI xác nhận xem có phải ads thật không.
-
-        Fix #1: Dùng substring check (giống _is_ads) thay vì equality check.
-        Lý do: _is_ads lọc bằng `kw in lower` (substring), nên một dòng như
-        "This content is stolen from royalroad" bị filter vì chứa "stolen content",
-        nhưng equality check `lower in self._global_keywords` lại không khớp
-        → dòng đó bị đưa vào candidates AI một cách thừa thãi.
-
-        min_count: chỉ lấy dòng xuất hiện >= N lần (tránh one-off false positive)
+        Dùng substring check (khớp với _is_ads logic).
         """
         summary = self.get_session_summary()
         candidates: list[str] = []
@@ -404,7 +422,6 @@ class AdsFilter:
             if info["count"] < min_count:
                 continue
             lower = line.lower()
-            # Substring check — khớp với logic trong _is_ads()
             already_known = (
                 any(kw in lower for kw in self._global_keywords)
                 or any(kw in lower for kw in self._domain_keywords)

@@ -98,6 +98,9 @@ async def _fetch_chapters(
     chapters:   list[tuple[str, str]] = []
     ai1_result: dict | None           = None
 
+    from core.scraper import _dtag
+    tag = _dtag(domain)
+
     # ── FIX: Nếu start_url là trang Index → tìm Chapter 1 thật sự trước ─────
     current_url = start_url
     if not RE_CHAP_URL.search(start_url):
@@ -174,7 +177,7 @@ async def _fetch_chapters(
                 except asyncio.CancelledError:
                     raise
                 except Exception as e:
-                    logger.warning("[%s] AI nav thất bại: %s", e)
+                    logger.warning("[%s] AI nav thất bại: %s", tag, e)
 
             if not next_url:
                 print(f"  [{tag}] ⚠ Không tìm được next URL sau Ch.{i+1}", flush=True)
@@ -262,8 +265,30 @@ async def _run_ai_calls(
                 print(f"     → Math [{ai3.get('math_format')}]: {ai3.get('math_evidence', [])[:2]}", flush=True)
             if ai3.get("special_symbols"):
                 print(f"     → Symbols: {ai3.get('special_symbols', [])[:8]}", flush=True)
+
+            # ── FIX: HTML scan fallback nếu AI #3 báo không có tables ────────
+            # AI chỉ phân tích Ch.3, nhưng <table> có thể xuất hiện ở ch khác.
+            # Nếu bất kỳ chapter nào trong 5 chapters học có <table>, bật flag.
+            if not fr["tables"]:
+                has_table_in_html = any("<table" in h.lower() for h in htmls)
+                if has_table_in_html:
+                    fr["tables"] = True
+                    print(
+                        f"     → Tables: AI báo không có nhưng HTML scan thấy <table> "
+                        f"→ bật flag",
+                        flush=True,
+                    )
         else:
-            print(f"  [Learn] ⚠ AI #3 thất bại — skip special content detection", flush=True)
+            print(f"  [Learn] ⚠ AI #3 thất bại — HTML scan fallback...", flush=True)
+            # AI thất bại hoàn toàn → chỉ dùng HTML scan
+            fr = acc.setdefault("formatting_rules", {})
+            if any("<table" in h.lower() for h in htmls):
+                fr["tables"] = True
+                print(f"     → Tables: detected via HTML scan", flush=True)
+            else:
+                fr.setdefault("tables", False)
+            fr.setdefault("math_support", False)
+            fr.setdefault("special_symbols", [])
 
     if len(htmls) >= 4:
         print(f"  [Learn] 🤖 AI #4: Analyze formatting elements từ Ch.4...", flush=True)

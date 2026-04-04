@@ -154,6 +154,11 @@ class PlaywrightPool:
                 raise
         raise RuntimeError("PlaywrightPool.fetch: unexpected exit")
 
+    async def close(self) -> None:          
+        """Public shutdown — gọi từ AppState.close()."""
+        async with self._lock:
+            await self._cleanup()
+
     async def _fetch_once(self, url: str) -> tuple[int, str]:
         context = await self._browser.new_context(
             user_agent         = CHROME_UA["chrome124"],

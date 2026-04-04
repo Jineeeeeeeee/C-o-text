@@ -2,7 +2,7 @@
 core/formatter.py — HTML → Markdown converter được điều khiển bởi site profile.
 
 MarkdownFormatter đọc FormattingRules từ profile và xử lý:
-  ✓ Tables         → Markdown tables (nếu rules.tables = True)
+  ✓ Tables         → Markdown tables (LUÔN LUÔN — không phụ thuộc flag)
   ✓ System boxes   → > **System:** ... (nếu rules.system_box có selectors)
   ✓ Hidden/spoiler → ||text|| hoặc ~~text~~ (nếu rules.hidden_text)
   ✓ Author notes   → > *Author's Note:* ... (nếu rules.author_note)
@@ -15,6 +15,11 @@ MarkdownFormatter đọc FormattingRules từ profile và xử lý:
   ✓ Lists          → - item / 1. item
 
 Khi không có rules (profile chưa learn) → fallback sang plain text extraction.
+
+FIX v2: Bỏ kiểm tra rules.get("tables") — luôn render <table> thành Markdown table.
+  Lý do: nếu HTML có <table>, đó là nội dung có cấu trúc (status screen, data, v.v.)
+  và cần được preserve. Việc flatten thành plain text làm mất thông tin quan trọng.
+  Profile flag "tables" giờ chỉ dùng để ghi nhận metadata, không ảnh hưởng rendering.
 """
 from __future__ import annotations
 
@@ -173,18 +178,12 @@ class MarkdownFormatter:
                     parts.append(f"[{alt}]")
             return
 
-        # Table
+        # ── Table: LUÔN render thành Markdown table ──────────────────────────
+        # FIX: bỏ kiểm tra rules.get("tables") — nếu HTML có <table> thì đó là
+        # nội dung có cấu trúc (system/status screen, data table, v.v.) cần preserve.
+        # Flatten thành plain text làm mất thông tin quan trọng cho LitRPG novels.
         if tag == "table":
-            if rules.get("tables", False):
-                self._render_table(node, parts)
-            else:
-                # Fallback: extract text từ cells
-                for cell in node.find_all(["td", "th"]):
-                    cell_parts: list[str] = []
-                    self._visit_children(cell, cell_parts)
-                    text = "".join(cell_parts).strip()
-                    if text:
-                        parts.append(text + "\n")
+            self._render_table(node, parts)
             return
 
         # Skip table structural tags nếu đã handled bởi _render_table

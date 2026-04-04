@@ -1,11 +1,19 @@
 """
-core/scraper.py — v12: Content-selector-aware HTML filtering + auto-learn high-freq ads.
+core/scraper.py — v13: Tiered ads detection + periodic auto-check.
 
-Thay đổi so với v11:
-  FIX-1: Truyền content_selector vào prepare_soup() để tránh remove_selectors
-         vô tình xóa nội dung bên trong content area (fanfiction.net bug).
-  FIX-2: _finalize_ads() phân tầng: ≥5× auto-add, 2–4× AI verify.
-  FMT:   Domain tag trên mọi dòng output → dễ đọc khi nhiều task song song.
+Thay đổi so với v12:
+  ADS-1: _ADS_AUTO_THRESHOLD tăng từ 5 → 10 (tín hiệu mạnh hơn)
+  ADS-2: _ADS_AI_MIN_COUNT = 3 (bỏ count 1–2, quá noisy)
+  ADS-3: _ADS_PERIODIC_INTERVAL = 50 — mỗi 50 chương auto-add tier ≥10
+          mà không cần gọi AI (tránh rate limit mid-session)
+  ADS-4: AI verify chỉ chạy cuối session cho tier 3–9
+  FIX-1: Giữ lại html_filter ancestor-protection (từ v12)
+  FIX-2: Giữ lại content_selector-aware remove (từ v12)
+
+Logic phân tầng:
+  count ≥ 10 → auto-add (không cần AI) — watermark cố định, không bao giờ là nội dung
+  count 3–9  → AI verify cuối session  — ambiguous, cần AI phân biệt
+  count 1–2  → bỏ qua                 — gần như chắc chắn là nội dung story
 """
 from __future__ import annotations
 
@@ -38,19 +46,15 @@ from ai.agents            import ai_classify_and_find, ai_find_first_chapter
 
 logger = logging.getLogger(__name__)
 
-# Số lần lặp tối thiểu để auto-add ads mà không cần AI
-_ADS_AUTO_THRESHOLD = 5
+# ── Ads tiers ─────────────────────────────────────────────────────────────────
+_ADS_AUTO_THRESHOLD  = 10   # ≥10 lần/session → auto-add, không cần AI
+_ADS_AI_MIN_COUNT    = 3    # 3–9 lần → AI verify cuối session
+_ADS_PERIODIC_INTERVAL = 50 # Kiểm tra auto-add mỗi N chương
 
 
 # ── Domain tag helper ─────────────────────────────────────────────────────────
 
 def _dtag(url_or_domain: str) -> str:
-    """
-    Trả về short domain label cố định 12 ký tự để align terminal output.
-    VD: "novelfire.net" → "novelfire   "
-        "www.royalroad.com" → "royalroad   "
-        "www.fanfiction.net" → "fanfiction  "
-    """
     if url_or_domain.startswith("http"):
         netloc = urlparse(url_or_domain).netloc.lower()
     else:
@@ -238,7 +242,6 @@ async def scrape_one_chapter(
         print(f"  [{tag}] 🏁 Hết truyện / junk page", flush=True)
         return None
 
-    # FIX-1: truyền content_selector để bảo vệ content area khỏi remove_selectors
     soup = await asyncio.to_thread(
         prepare_soup, html,
         profile.get("remove_selectors"),
@@ -359,7 +362,45 @@ async def _find_next_and_save(
     return next_url
 
 
-# ── Ads finalization ──────────────────────────────────────────────────────────
+# ── Periodic ads check (no AI, auto-tier only) ────────────────────────────────
+
+async def _periodic_ads_check(
+    ads_filter : AdsFilter,
+    domain     : str,
+    pm         : ProfileManager,
+    tag        : str,
+    chapter_num: int,
+) -> None:
+    """
+    Định kỳ auto-add watermarks tier ≥ _ADS_AUTO_THRESHOLD mà không dùng AI.
+
+    Chạy mỗi _ADS_PERIODIC_INTERVAL chương để bắt watermarks sớm —
+    không chờ đến cuối session tránh Ctrl+C làm mất kết quả.
+
+    Không gọi AI ở đây vì:
+    1. Tránh rate limit trong khi đang scrape chính
+    2. Tier ≥10 đã đủ tự tin để auto-add
+    3. AI verify cho tier 3–9 vẫn chạy ở cuối session
+    """
+    auto_candidates, _ = ads_filter.get_candidates_by_frequency(
+        auto_threshold = _ADS_AUTO_THRESHOLD,
+        min_count      = _ADS_AUTO_THRESHOLD,   # chỉ lấy tier ≥10
+        max_results    = 15,
+    )
+    if not auto_candidates:
+        return
+
+    added = ads_filter.apply_verified(auto_candidates)
+    if added > 0:
+        print(
+            f"  [{tag}] [Ads] 🔒 Ch.{chapter_num} định kỳ: "
+            f"+{added} auto (≥{_ADS_AUTO_THRESHOLD}×) | {ads_filter.stats}",
+            flush=True,
+        )
+        await pm.add_ads_to_profile(domain, auto_candidates)
+
+
+# ── Ads finalization (end of session) ─────────────────────────────────────────
 
 async def _finalize_ads(
     ads_filter : AdsFilter,
@@ -371,12 +412,14 @@ async def _finalize_ads(
     """
     Finalize ads sau khi scrape xong / bị cancel.
 
-    Phân tầng xử lý:
-      Tier 1 — Auto-add (count ≥ _ADS_AUTO_THRESHOLD):
-        Lặp đủ nhiều → chắc chắn là watermark cố định → thêm ngay, không cần AI.
-      Tier 2 — AI verify (2 ≤ count < threshold):
-        Không chắc → gửi AI phân biệt ads thật vs false positive.
+    Tier structure:
+      Tier 1 — Auto-add (count ≥ _ADS_AUTO_THRESHOLD = 10):
+        Lặp đủ nhiều → watermark cố định, không cần AI.
+      Tier 2 — AI verify (count _ADS_AI_MIN_COUNT ≤ count < threshold):
+        Ambiguous → AI phân biệt ads vs false positive.
         Chỉ chạy khi NOT cancelled.
+      Tier 3 — Ignore (count 1–2):
+        Quá ít, gần như chắc chắn là nội dung truyện.
     """
     from ai.agents import ai_verify_ads
 
@@ -385,7 +428,7 @@ async def _finalize_ads(
 
     auto_candidates, ai_candidates = ads_filter.get_candidates_by_frequency(
         auto_threshold = _ADS_AUTO_THRESHOLD,
-        min_count      = 2,
+        min_count      = _ADS_AI_MIN_COUNT,
         max_results    = 20,
     )
 
@@ -402,10 +445,10 @@ async def _finalize_ads(
             )
             await pm.add_ads_to_profile(domain, auto_candidates)
 
-    # ── Tier 2: AI verify low-frequency ──────────────────────────────────────
+    # ── Tier 2: AI verify (count 3–9) ────────────────────────────────────────
     if not cancelled and ai_candidates:
         print(
-            f"  [Ads] 🤖 AI xác nhận {len(ai_candidates)} dòng không rõ...",
+            f"  [Ads] 🤖 AI xác nhận {len(ai_candidates)} dòng (3–9× /phiên)...",
             flush=True,
         )
         try:
@@ -439,10 +482,10 @@ async def _finalize_ads(
         verified_results if verified_results else None,
     )
     if review_path:
-        summary    = ads_filter.get_session_summary()
-        total      = len(summary)
+        summary     = ads_filter.get_session_summary()
+        total       = len(summary)
         confirmed_n = sum(1 for v in verified_results.values() if v)
-        icon       = "🛑" if cancelled else "📋"
+        icon        = "🛑" if cancelled else "📋"
         print(
             f"  [Ads] {icon} {total} dòng lọc"
             + (f" | {confirmed_n} xác nhận" if confirmed_n else "")
@@ -562,8 +605,15 @@ async def run_novel_task(
                 consecutive_errors   = 0
                 consecutive_timeouts = 0
 
-                if on_chapter_done and progress.get("chapter_count", 0) > prev_count:
+                ch_count = progress.get("chapter_count", 0)
+
+                if on_chapter_done and ch_count > prev_count:
                     await on_chapter_done()
+
+                # ── Periodic ads check mỗi N chương ──────────────────────────
+                # Chỉ auto-add tier ≥10, không gọi AI để tránh rate limit
+                if ch_count > 0 and ch_count % _ADS_PERIODIC_INTERVAL == 0:
+                    await _periodic_ads_check(ads_filter, domain, pm, tag, ch_count)
 
                 current_url = next_url
 
