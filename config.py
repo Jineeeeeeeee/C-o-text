@@ -26,6 +26,11 @@ MAX_CONSECUTIVE_ERRORS   = 5
 MAX_CONSECUTIVE_TIMEOUTS = 3
 TIMEOUT_BACKOFF_BASE     = 30   # seconds
 
+# ── Empty streak / retry ──────────────────────────────────────────────────────
+MAX_EMPTY_STREAK  = 10   # Số chapters rỗng liên tiếp trước khi thử recover (tăng từ 5→10)
+MAX_EMPTY_RETRIES = 1    # Số lần retry sau khi nghi rate-limit
+EMPTY_BACKOFF     = 60   # seconds chờ khi nghi rate-limit
+
 # ── Paths ─────────────────────────────────────────────────────────────────────
 DATA_DIR      = "data"
 OUTPUT_DIR    = "output"
@@ -85,8 +90,8 @@ _DELAY_PROFILES: dict[str, tuple[float, float]] = {
     "www.scribblehub.com" : (4.0, 10.0),
     "wattpad.com"         : (3.0,  8.0),
     "www.wattpad.com"     : (3.0,  8.0),
-    "fanfiction.net"      : (2.0,  6.0),
-    "www.fanfiction.net"  : (2.0,  6.0),
+    "fanfiction.net"      : (4.0, 10.0),
+    "www.fanfiction.net"  : (4.0, 10.0),
     "archiveofourown.org" : (2.0,  5.0),
     "www.webnovel.com"    : (3.0,  7.0),
 }

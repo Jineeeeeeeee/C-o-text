@@ -56,6 +56,207 @@ from ai.agents  import (
 logger = logging.getLogger(__name__)
 
 
+# ── Prose & content helpers ──────────────────────────────────────────────────────────
+
+def _html_has_prose(html: str, min_paragraphs: int = 2, min_chars: int = 100) -> bool:
+    """Kiểm tra nhanh HTML có chứa prose text hay không (không cần AI)."""
+    soup = BeautifulSoup(html, "html.parser")
+    for unwanted in soup.find_all(["script", "style", "noscript"]):
+        unwanted.decompose()
+    prose_count = sum(
+        1 for p in soup.find_all("p")
+        if len(p.get_text(strip=True)) >= 50
+    )
+    if prose_count >= min_paragraphs:
+        return True
+    # Fallback: kiểm tra tổng body text
+    body = soup.find("body")
+    if body and len(body.get_text(strip=True)) >= min_chars * 3:
+        return True
+    return False
+
+
+def _validate_content_richness(
+    chapters: list[tuple[str, str]],
+) -> tuple[bool, str]:
+    """
+    Kiểm tra HTML fetch được thực sự chứa text content.
+    Dung heuristic nhanh (không cần AI):
+      - Đếm chapters có prose (>= 3 đoạn văn ≥ 50 chars)
+      - Nếu ≥80% chapters có prose → PASS
+      - Nếu <50% → FAIL (đánh dấu JS_RENDERED)
+    Returns: (is_valid, reason)
+    """
+    if not chapters:
+        return False, "NO_CHAPTERS"
+    rich_count = 0
+    for _, html in chapters:
+        if _html_has_prose(html, min_paragraphs=3, min_chars=50):
+            rich_count += 1
+    ratio = rich_count / len(chapters)
+    if ratio >= 0.8:
+        return True, f"{rich_count}/{len(chapters)} chapters có prose"
+    if ratio < 0.5:
+        return False, f"JS_RENDERED suspected: chỉ {rich_count}/{len(chapters)} chapters có prose"
+    return True, f"{rich_count}/{len(chapters)} chapters (marginal)"
+
+
+async def _retry_with_playwright(
+    chapters  : list[tuple[str, str]],
+    pw_pool   : PlaywrightPool,
+    domain    : str,
+    pool      : DomainSessionPool,
+) -> list[tuple[str, str]]:
+    """
+    Re-fetch các chapters bị empty bằng Playwright.
+    Giữ chapters đã có nội dung, chỉ fetch lại chapters rỗng.
+    """
+    from core.scraper import _dtag
+    tag = _dtag(domain)
+    result: list[tuple[str, str]] = []
+    for url, html in chapters:
+        if _html_has_prose(html, min_paragraphs=3):
+            result.append((url, html))
+        else:
+            print(f"  [{tag}] 🔄 Re-fetch (PW): {url[:60]}", flush=True)
+            try:
+                status, pw_html = await pw_pool.fetch(url)
+                if not is_junk_page(pw_html, status):
+                    result.append((url, pw_html))
+                else:
+                    result.append((url, html))  # giữ original
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.warning("[%s] Playwright re-fetch thất bại: %s", tag, e)
+                result.append((url, html))  # giữ original
+        await asyncio.sleep(2.0)
+    # Đánh dấu domain cần Playwright
+    pool.mark_cf_domain(domain)
+    return result
+
+
+def _find_best_title_fallback(soup: BeautifulSoup) -> str | None:
+    """Tìm title selector tốt nhất khi selector hiện tại không hợp lệ."""
+    for sel in ("h1", ".chapter-title", ".title", "[class*='chapter-title']",
+                "[class*='chapter_title']", "[class*='chaptitle']", "h2"):
+        try:
+            el = soup.select_one(sel)
+            if el:
+                text = el.get_text(strip=True)
+                if 3 <= len(text) <= 200 and "\n" not in text[:50]:
+                    return sel
+        except Exception:
+            continue
+    return None
+
+
+def _verify_profile_selectors(
+    profile  : dict,
+    chapters : list[tuple[str, str]],
+) -> tuple[dict, list[str]]:
+    """
+    Chạy selectors thật trên HTML đã fetch và verify kết quả.
+    Checks:
+      1. content_selector → có trả về ≥20 0chars text?
+      2. title_selector → có trả về chuỗi hợp lý (3-200 chars, không dropdown)?
+      3. next_selector → có trả về <a> tag với href?
+    Returns: (fixed_profile, warnings)
+    """
+    warnings: list[str] = []
+    sample = chapters[:3]
+
+    content_sel = profile.get("content_selector")
+    title_sel   = profile.get("title_selector")
+    next_sel    = profile.get("next_selector")
+
+    uncertain = list(profile.get("uncertain_fields") or [])
+
+    for url, html in sample:
+        soup = BeautifulSoup(html, "html.parser")
+
+        # 1. Content selector verification
+        if content_sel:
+            try:
+                el = soup.select_one(content_sel)
+                if el:
+                    text = el.get_text(separator=" ", strip=True)
+                    if len(text) < 200:
+                        warnings.append(
+                            f"content_selector {content_sel!r} trả về chỉ {len(text)} chars "
+                            f"- có thể là JS-rendered hoặc selector sai"
+                        )
+                        if "content_selector" not in uncertain:
+                            uncertain.append("content_selector")
+                else:
+                    warnings.append(f"content_selector {content_sel!r} không tìm thấy element")
+                    if "content_selector" not in uncertain:
+                        uncertain.append("content_selector")
+            except Exception as e:
+                warnings.append(f"content_selector lỗi: {e}")
+
+        # 2. Title selector sanity check
+        if title_sel:
+            try:
+                el = soup.select_one(title_sel)
+                if el:
+                    text = el.get_text(strip=True)
+                    # Kiểm tra dropdown/list
+                    if el.name in ("select", "option", "ul", "ol"):
+                        warnings.append(
+                            f"title_selector {title_sel!r} là {el.name} tag (dropdown!) "
+                            f"— thay bằng fallback"
+                        )
+                        fb = _find_best_title_fallback(soup)
+                        if fb:
+                            profile["title_selector"] = fb
+                            if "title_selector" not in uncertain:
+                                uncertain.append("title_selector")
+                        break
+                    # Kiểm tra quá dài (có thể là list chapters)
+                    if len(text) > 300:
+                        warnings.append(
+                            f"title_selector {title_sel!r} trả về {len(text)} chars "
+                            f"— có thể là dropdown/list"
+                        )
+                        fb = _find_best_title_fallback(soup)
+                        if fb:
+                            profile["title_selector"] = fb
+                            if "title_selector" not in uncertain:
+                                uncertain.append("title_selector")
+                        break
+                    # Kiểm tra multiline (có thể là list)
+                    if text.count("\n") > 5:
+                        warnings.append(
+                            f"title_selector {title_sel!r} có {text.count(chr(10))} dòng "
+                            f"— multiline suspect"
+                        )
+                        fb = _find_best_title_fallback(soup)
+                        if fb:
+                            profile["title_selector"] = fb
+                        break
+            except Exception as e:
+                warnings.append(f"title_selector lỗi: {e}")
+
+        # 3. Next selector verification
+        if next_sel:
+            try:
+                el = soup.select_one(next_sel)
+                if not el:
+                    warnings.append(f"next_selector {next_sel!r} không tìm thấy element")
+                elif el.name != "a" and not el.find("a"):
+                    warnings.append(
+                        f"next_selector {next_sel!r} → {el.name} tag, không có href"
+                    )
+            except Exception as e:
+                warnings.append(f"next_selector lỗi: {e}")
+
+        break  # chỉ kiểm tra 1 chapter đầu tiên thôi (các chạy đánh giá sau nếu cần)
+
+    profile["uncertain_fields"] = uncertain
+    return profile, warnings
+
+
 async def run_learning_phase(
     start_url  : str,
     pool       : DomainSessionPool,
@@ -95,10 +296,40 @@ async def run_learning_phase(
     n = len(chapters)
     print(f"  [{tag}] ✓ Fetched {n}/{LEARNING_CHAPTERS} chapters\n", flush=True)
 
-    # ── Run 10 AI calls ───────────────────────────────────────────────────────
+    # ── Content Validation Gate ─────────────────────────────────────────────────────
+    force_playwright = False
+    is_rich, reason = _validate_content_richness(chapters)
+    if not is_rich:
+        print(f"  [{tag}] ⚠ Content validation FAIL: {reason}", flush=True)
+        print(f"  [{tag}] 🔄 Re-fetching tất cả chapters bằng Playwright...", flush=True)
+        chapters = await _retry_with_playwright(chapters, pw_pool, domain, pool)
+        force_playwright = True
+        # Kiểm tra lại sau khi re-fetch
+        is_rich2, reason2 = _validate_content_richness(chapters)
+        if is_rich2:
+            print(f"  [{tag}] ✅ Playwright giải quyết: {reason2}", flush=True)
+        else:
+            print(
+                f"  [{tag}] ⚠ Vẫn thiếu nội dung sau PW: {reason2} — tiếp tục học...",
+                flush=True,
+            )
+
+    # ── Run 10 AI calls ───────────────────────────────────────────────────────────────────
     profile = await _run_10_ai_calls(chapters, domain, ai_limiter)
     if profile is None:
         return None
+
+    # Ghi force_playwright vào profile nếu cần
+    if force_playwright and not profile.get("requires_playwright"):
+        profile["requires_playwright"] = True
+        print(f"  [{tag}] 🔒 force requires_playwright=True (JS-rendered site)", flush=True)
+
+    # ── Selector Verification (post-learning) ─────────────────────────────────────────
+    profile, sel_warnings = _verify_profile_selectors(profile, chapters)
+    if sel_warnings:
+        print(f"  [{tag}] ⚠ Selector verification warnings:", flush=True)
+        for w in sel_warnings:
+            print(f"     • {w}", flush=True)
 
     await pm.save_profile(domain, profile)
 
@@ -183,6 +414,38 @@ async def _fetch_chapters(
             if i == 0:
                 # Ch.1 dùng Playwright để đảm bảo full render
                 status, html = await pw_pool.fetch(current_url)
+            elif i == 1:
+                # Ch.2: So sánh curl vs Playwright — phát hiện JS-rendered sites
+                try:
+                    status_curl, html_curl = await pool.fetch(current_url)
+                except Exception:
+                    status_curl, html_curl = 0, ""
+
+                if _html_has_prose(html_curl):
+                    # curl có prose → dùng hợp lệ
+                    status, html = status_curl, html_curl
+                else:
+                    # curl rỗng → thử Playwright
+                    print(
+                        f"  [{tag}] 🔍 Ch.2 curl rỗng — test Playwright...",
+                        flush=True,
+                    )
+                    try:
+                        status_pw, html_pw = await pw_pool.fetch(current_url)
+                    except Exception:
+                        status_pw, html_pw = 0, ""
+
+                    if _html_has_prose(html_pw):
+                        print(
+                            f"  [{tag}] 🌐 JS-rendered site phát hiện! "
+                            f"Chuyển sang Playwright cho Ch.3-10.",
+                            flush=True,
+                        )
+                        pool.mark_cf_domain(domain)
+                        status, html = status_pw, html_pw
+                    else:
+                        # Cả hai đều rỗng — dùng curl (Content Validation Gate sẽ xử lý sau)
+                        status, html = status_curl, html_curl
             else:
                 status, html = await fetch_page(current_url, pool, pw_pool)
         except asyncio.CancelledError:

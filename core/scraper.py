@@ -23,6 +23,7 @@ from bs4 import BeautifulSoup
 from config import (
     MAX_CHAPTERS, MAX_CONSECUTIVE_ERRORS, MAX_CONSECUTIVE_TIMEOUTS,
     TIMEOUT_BACKOFF_BASE, RE_CHAP_URL, get_delay,
+    MAX_EMPTY_STREAK, MAX_EMPTY_RETRIES, EMPTY_BACKOFF,
 )
 from utils.file_io        import load_progress, save_progress, write_markdown
 from utils.string_helpers import (
@@ -45,7 +46,6 @@ logger = logging.getLogger(__name__)
 _ADS_AUTO_THRESHOLD = 10
 _ADS_AI_MIN_COUNT   = 3
 _ADS_FREQ_MIN_FILES = 5
-MAX_EMPTY_STREAK    = 5
 
 
 def _dtag(url_or_domain: str) -> str:
@@ -677,6 +677,7 @@ async def run_novel_task(
     consecutive_errors   = 0
     consecutive_timeouts = 0
     consecutive_empty    = 0
+    _did_empty_retry     = False   # Đã thử backoff retry chưa
     _cancelled           = False
 
     try:
@@ -710,24 +711,80 @@ async def run_novel_task(
 
                 new_count = progress.get("chapter_count", 0)
                 if new_count > prev_count:
-                    consecutive_empty = 0
+                    consecutive_empty    = 0
+                    _did_empty_retry     = False   # reset khi thành công
                     if on_chapter_done:
                         await on_chapter_done()
                 else:
                     consecutive_empty += 1
                     if consecutive_empty >= MAX_EMPTY_STREAK:
-                        print(
-                            f"\n  [{tag}] ⏸  Tạm dừng: {MAX_EMPTY_STREAK} chương "
-                            f"liên tiếp không có nội dung.",
-                            flush=True,
-                        )
-                        issue_reporter.report(
-                            "EMPTY_STREAK", current_url,
-                            detail=f"{MAX_EMPTY_STREAK} consecutive empty chapters.",
-                            chapter_num=progress.get("chapter_count", 0) + 1,
-                        )
-                        await save_progress(progress_path, progress)
-                        break
+                        # ── SMART EMPTY STREAK ────────────────────────────────
+                        # Không dừng ngay — thử phân biệt rate-limit vs hết truyện
+
+                        # Bước 1: Thử switch sang Playwright nếu đang dùng curl
+                        switched_to_pw = False
+                        if not pool.is_cf_domain(domain):
+                            print(
+                                f"  [{tag}] 🔍 Empty streak {consecutive_empty} "
+                                f"— thử Playwright fallback...",
+                                flush=True,
+                            )
+                            try:
+                                from bs4 import BeautifulSoup as _BS
+                                from core.extractor import extract_chapter as _extract
+                                from utils.string_helpers import is_junk_page as _is_junk
+                                pw_status, pw_html = await pw_pool.fetch(current_url)
+                                if not _is_junk(pw_html, pw_status):
+                                    pw_soup = _BS(pw_html, "html.parser")
+                                    pw_content, _, _ = await asyncio.to_thread(
+                                        _extract, pw_soup, current_url, profile
+                                    )
+                                    if pw_content and len(pw_content.strip()) >= 100:
+                                        print(
+                                            f"  [{tag}] ✅ Playwright có nội dung! "
+                                            f"Chuyển toàn domain sang Playwright.",
+                                            flush=True,
+                                        )
+                                        pool.mark_cf_domain(domain)
+                                        consecutive_empty = 0
+                                        switched_to_pw    = True
+                            except asyncio.CancelledError:
+                                raise
+                            except Exception as _pw_err:
+                                logger.debug("[%s] PW fallback lỗi: %s", tag, _pw_err)
+
+                        if switched_to_pw:
+                            pass  # tiếp tục vòng lặp, không cần retry/backoff
+
+                        # Bước 2: Backoff wait — phân biệt rate-limit vs hết truyện
+                        elif not _did_empty_retry:
+                            _did_empty_retry = True
+                            print(
+                                f"  [{tag}] ⏳ Nghi rate-limit — chờ {EMPTY_BACKOFF}s "
+                                f"rồi thử lại...",
+                                flush=True,
+                            )
+                            await asyncio.sleep(EMPTY_BACKOFF)
+                            consecutive_empty = 0
+                            # tiếp tục vòng lặp
+
+                        else:
+                            # Đã retry rồi vẫn empty → thất sự hết/bị block
+                            print(
+                                f"\n  [{tag}] ⏸  Dừng: {MAX_EMPTY_STREAK} chương rỗng "
+                                f"sau cả Playwright + backoff retry.",
+                                flush=True,
+                            )
+                            issue_reporter.report(
+                                "EMPTY_STREAK", current_url,
+                                detail=(
+                                    f"{MAX_EMPTY_STREAK} consecutive empty chapters "
+                                    f"after PW-switch + {EMPTY_BACKOFF}s backoff."
+                                ),
+                                chapter_num=progress.get("chapter_count", 0) + 1,
+                            )
+                            await save_progress(progress_path, progress)
+                            break
 
                 current_url = next_url
 
