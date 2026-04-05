@@ -10,6 +10,7 @@ progress_*.json
 data/
 links.txt
 progress/
+issues.md
 
 # Python
 __pycache__/
