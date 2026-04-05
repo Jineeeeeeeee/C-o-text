@@ -1,11 +1,18 @@
 """
-utils/ads_filter.py — v7: Smart ads notification + _notified_ads set.
+utils/ads_filter.py — v8: Fix false positive story content + smarter auto-approve.
 
-Thay đổi so với v6:
-  NEW: _notified_ads set — track những ads đã từng thông báo.
-       filter() chỉ in ra console khi gặp ads MỚI chưa từng thấy trong session.
-       Ads cũ đã biết → lọc âm thầm, không in gì.
-       Output mới: "[Ads] 🆕 NEW: 'Read at novelfire'" thay vì "[Ads] -234c"
+Thay đổi so với v7:
+  FIX-B1: get_candidates_by_frequency() — bỏ auto_threshold generic.
+           Auto-approve CHỈ cho lines là script/JS injection (100% ads).
+           Tất cả candidates còn lại → AI verify.
+  FIX-B3: _looks_like_story_content() — nhận diện RPG/LitRPG markers:
+           - Bold/italic markdown (**text**, *text*, ***text***)
+           - Bracket notation [Skill Name (Rarity)]
+           - Arrow/upgrade notation (-->, →)
+           - Status field lines (**Field:** [value])
+           - Rarity keywords: (Common), (Rare), (Legendary), (Unique), (Ancient)...
+  FIX-B1b: _SUSPECT_MIN_FILES tăng từ 5 → 8 để giảm false positives từ
+            scan_edges_for_suspects().
 
 Pipeline ads (không thay đổi):
   [Scraping]
@@ -14,11 +21,11 @@ Pipeline ads (không thay đổi):
     write_markdown()          → save file với dòng lạ còn nguyên
 
   [Cuối session]
-    get_candidates_by_frequency(min_count=3) → candidates từ session_log
-    get_new_frequency_suspects(min_count=5)  → candidates từ edge scan
-    ai_verify_ads()                          → AI xác nhận tất cả
-    post_process_directory(confirmed, dir)   → xóa retroactively từ files
-    add_ads_to_profile()                     → lưu profile cho lần sau
+    get_candidates_by_frequency()    → script lines auto-approve, còn lại → AI
+    get_new_frequency_suspects()     → candidates từ edge scan
+    ai_verify_ads()                  → AI xác nhận tất cả non-script candidates
+    post_process_directory(confirmed)→ xóa retroactively từ files
+    add_ads_to_profile()             → lưu profile cho lần sau
 """
 from __future__ import annotations
 
@@ -41,10 +48,12 @@ logger = logging.getLogger(__name__)
 _MIN_LINE_LEN   = 15
 _ADS_REVIEW_DIR = os.path.join(os.path.dirname(ADS_DB_FILE), "ads_review")
 _ADS_DB_WRITE_LOCK = threading.Lock()
+
 # Suspect edge scan config
 _SUSPECT_SCAN_EDGES = 8    # Quét N dòng đầu và N dòng cuối mỗi chapter
 _SUSPECT_MAX_LEN    = 250  # Watermarks hiếm khi dài hơn thế này
-_SUSPECT_MIN_FILES  = 5    # Xuất hiện trong ≥ N chapter files mới là suspect
+_SUSPECT_MIN_FILES  = 8    # FIX-B1b: Tăng từ 5 → 8 để giảm false positives
+
 
 # ── Global keywords ───────────────────────────────────────────────────────────
 _SEED_GLOBAL_KEYWORDS: list[str] = [
@@ -108,14 +117,73 @@ _SEED_PATTERNS_RAW: list[str] = [
 ]
 
 _GENERIC_KEYWORD_BLACKLIST: frozenset[str] = frozenset({
+    # ── Navigation / UI words — extremely common in story dialogue ────────────
+    "next", "previous", "back", "forward", "prev",
+    "next chapter", "previous chapter",
+    "report", "submit", "save", "load", "reload",
+
+    # ── Generic web/nav words ─────────────────────────────────────────────────
     "search", "log in", "login", "read", "find", "chapter", "story",
     "novel", "series", "book", "text", "content", "page", "link", "click",
-    "here", "site", "web", "online", "free",
-    "royal road", "royalroad", "fanfiction", "wattpad", "webnovel",
+    "here", "site", "web", "online", "free", "home", "menu",
+
+    # ── Site names — partial matches dangerous in fantasy story context ───────
+    "royal road",           # "royal road to power", "a royal road..."
+    "royalroad",
+    "fanfiction",           # "fanfiction.net" more specific is OK
+    "wattpad", "webnovel",
     "scribble", "archive", "ao3",
-    "the primal hunter", "monster cultivator", "system", "bloodline",
-    "realm", "cultivation", "dungeon", "quest", "skill", "class",
+    "novel fire",           # "novelfire.net" more specific is OK
+
+    # ── Story-genre common words — LitRPG, xianxia, fantasy ──────────────────
+    "the primal hunter", "monster cultivator",
+    "system", "bloodline", "realm", "cultivation",
+    "dungeon", "quest", "skill", "class",
+    "chapter navigation",   # UI label, but too generic as keyword
 })
+
+# ── FIX-B3: RPG/Story content markers ────────────────────────────────────────
+# Lines matching ANY of these patterns are story content, never ads.
+# Checked BEFORE frequency-based candidate selection.
+
+# Script/JS injection — these are 100% ads, safe to auto-approve
+_JS_INJECTION_RE = re.compile(
+    r"<script[\s>]"
+    r"|window\.pubfuturetag"
+    r"|window\.googletag"
+    r"|window\.adsbygoogle"
+    r"|googletag\.cmd\.push"
+    r"|pubfuturetag\.push\("
+    r"|\"unit\"\s*:\s*\"[^\"]+\"\s*,\s*\"id\"\s*:\s*\"pf-",
+    re.IGNORECASE,
+)
+
+# RPG/LitRPG system content markers — story content, NOT ads
+_RPG_RARITY_RE = re.compile(
+    r"\((Common|Uncommon|Rare|Epic|Legendary|Unique|Ancient|Mythic|"
+    r"Inferior|Superior|Elite|Boss|Divine|Transcendent)\)",
+    re.IGNORECASE,
+)
+
+_RPG_BOLD_FIELD_RE = re.compile(
+    r"^\*{1,3}[^*].*\*{1,3}\s*$"   # ***text*** or **text** or *text*
+    r"|^\*{1,3}\w.*:\*{0,3}"        # **Field:** value
+    r"|\*{1,3}[A-Z][^*]+\*{1,3}",  # ***Skill Name Upgraded***
+    re.MULTILINE,
+)
+
+_RPG_BRACKET_RE = re.compile(
+    r"\[[A-Z][^\[\]]{2,60}\]",       # [Skill Name Here]
+)
+
+_RPG_UPGRADE_RE = re.compile(
+    r"-->"                            # skill upgrade arrow
+    r"|\u2192"                        # → unicode arrow
+    r"|\bUpgraded\b"
+    r"|\bAwakened\b"
+    r"|\bTransformed\b",
+    re.IGNORECASE,
+)
 
 _STORY_LINE_RE = re.compile(
     r'^["""''„]'
@@ -127,11 +195,31 @@ _STORY_LINE_RE = re.compile(
 )
 
 
+def _is_rpg_story_content(line: str) -> bool:
+    """
+    FIX-B3: Nhận diện RPG/LitRPG system box content.
+    Trả về True nếu line là story content (skill box, status screen, v.v.).
+    """
+    # Rarity keywords — strongest signal
+    if _RPG_RARITY_RE.search(line):
+        return True
+    # Bold/italic markdown wrapping entire line or field label
+    if _RPG_BOLD_FIELD_RE.search(line):
+        return True
+    # Bracket notation [Skill Name ...]
+    if _RPG_BRACKET_RE.search(line):
+        return True
+    # Upgrade/transform arrows
+    if _RPG_UPGRADE_RE.search(line):
+        return True
+    return False
+
+
 class AdsFilter:
     """
     Lọc ads/watermark bằng keyword và regex.
 
-    v7: Thêm _notified_ads — chỉ print khi gặp ads MỚI trong session.
+    v8: Fix B1 (auto-approve chỉ cho JS injection) + Fix B3 (RPG content guard).
     """
 
     def __init__(self, domain: str | None = None) -> None:
@@ -155,10 +243,6 @@ class AdsFilter:
 
         self._session_log: list[dict] = []
         self._freq_counter: dict[str, dict] = {}
-
-        # ── v7 NEW: track ads đã thông báo trong session này ──────────────
-        # Key = normalized line (lowercase stripped)
-        # Chỉ print khi key chưa có trong set này
         self._notified_ads: set[str] = set()
 
     # ── Factory ───────────────────────────────────────────────────────────
@@ -197,9 +281,7 @@ class AdsFilter:
     def filter(self, text: str, chapter_url: str = "") -> str:
         """
         Xóa các dòng khớp với CONFIRMED keywords/patterns.
-
-        v7: Chỉ print thông báo khi gặp ads MỚI (chưa có trong _notified_ads).
-            Ads đã biết → lọc âm thầm.
+        Chỉ print thông báo khi gặp ads MỚI (chưa có trong _notified_ads).
         """
         lines = text.splitlines()
         kept: list[str] = []
@@ -212,7 +294,6 @@ class AdsFilter:
                     "line"       : stripped,
                     "chapter_url": chapter_url,
                 })
-                # ── v7: chỉ thông báo nếu là ads MỚI ─────────────────────
                 key = stripped.lower()
                 if key not in self._notified_ads:
                     self._notified_ads.add(key)
@@ -220,9 +301,8 @@ class AdsFilter:
             else:
                 kept.append(ln)
 
-        # In thông báo gộp cho các ads MỚI trong chương này
         if new_ads_found:
-            for ads_line in new_ads_found[:3]:   # tối đa 3 dòng để không spam
+            for ads_line in new_ads_found[:3]:
                 short = ads_line[:60] + "…" if len(ads_line) > 60 else ads_line
                 print(f"  [Ads] 🆕 NEW: {short!r}", flush=True)
             if len(new_ads_found) > 3:
@@ -231,7 +311,6 @@ class AdsFilter:
                     flush=True,
                 )
 
-        # Gộp blank lines thừa
         result: list[str] = []
         blanks = 0
         for ln in kept:
@@ -275,10 +354,26 @@ class AdsFilter:
             self._update_freq(stripped, chapter_url, chapter_file)
 
     def _looks_like_story_content(self, line: str) -> bool:
+        """
+        FIX-B3: Nhận diện story content để không đưa vào suspect list.
+        Bao gồm RPG/LitRPG markers, dialogue, và narrative lines.
+        """
         words = line.split()
+        # Long lines are almost always story content
         if len(words) > 10:
             return True
+        # Story line openers (He/She/I/The/A/But...)
         if _STORY_LINE_RE.match(line):
+            return True
+        # Dialogue: chứa dấu ngoặc kép → story content
+        # Bao gồm cả straight quotes và curly quotes
+        if any(c in line for c in ('"', '\u201c', '\u201d', '\u2018', '\u2019')):
+            return True
+        # Narrative markers: ellipsis hoặc em-dash → thường là story prose
+        if '\u2026' in line or '\u2014' in line or '.....' in line:
+            return True
+        # FIX-B3: RPG system content guard
+        if _is_rpg_story_content(line):
             return True
         return False
 
@@ -304,6 +399,12 @@ class AdsFilter:
             lower = line.lower()
             if (any(kw in lower for kw in self._global_keywords) or
                     any(kw in lower for kw in self._domain_keywords)):
+                continue
+            # FIX-B3: Double-check RPG content không lọt vào suspect list
+            if _is_rpg_story_content(line):
+                logger.debug(
+                    "[AdsFilter] Skipping RPG content from suspects: %r", line[:60]
+                )
                 continue
             suspects.append((line, file_count))
         suspects.sort(key=lambda x: -x[1])
@@ -400,10 +501,19 @@ class AdsFilter:
 
     def get_candidates_by_frequency(
         self,
-        auto_threshold: int = 10,
+        auto_threshold: int = 10,   # kept for signature compat, semantics changed
         min_count     : int = 3,
         max_results   : int = 20,
     ) -> tuple[list[str], list[str]]:
+        """
+        FIX-B1: Tách candidates thành 2 buckets:
+          auto_add  — CHỈ script/JS injection lines (100% safe to auto-approve)
+          ai_verify — Tất cả candidates còn lại (kể cả count ≥ auto_threshold)
+
+        Lý do: high-frequency không đồng nghĩa với ads — RPG skill names,
+        recurring story phrases cũng có thể đạt threshold.
+        Script/JS lines thì luôn luôn là ads, không cần AI confirm.
+        """
         summary   = self.get_session_summary()
         auto_add  : list[str] = []
         ai_verify : list[str] = []
@@ -412,6 +522,7 @@ class AdsFilter:
             count = info["count"]
             if count < min_count:
                 continue
+
             lower = line.lower()
             already_known = (
                 any(kw in lower for kw in self._global_keywords) or
@@ -419,10 +530,20 @@ class AdsFilter:
             )
             if already_known:
                 continue
-            if count >= auto_threshold:
+
+            # FIX-B3: RPG story content guard — tuyệt đối không approve
+            if _is_rpg_story_content(line):
+                logger.debug(
+                    "[AdsFilter] RPG content blocked from candidates: %r", line[:60]
+                )
+                continue
+
+            # FIX-B1: Auto-approve CHỈ khi là JS injection (100% ads)
+            if _JS_INJECTION_RE.search(line):
                 if len(auto_add) < max_results:
                     auto_add.append(line)
             else:
+                # Tất cả còn lại → AI verify, bất kể count cao đến mấy
                 if len(ai_verify) < max_results:
                     ai_verify.append(line)
 
@@ -439,6 +560,13 @@ class AdsFilter:
             if not isinstance(kw, str):
                 continue
             kw_lower = kw.lower().strip()
+            # FIX-B1: Không inject RPG story content keywords từ profile
+            # (guard against bad data that may have been learned in previous sessions)
+            if _is_rpg_story_content(kw_lower):
+                logger.warning(
+                    "[AdsFilter] Skipping RPG content keyword from profile: %r", kw_lower
+                )
+                continue
             if (kw_lower and
                     kw_lower not in self._global_keywords and
                     kw_lower not in self._domain_keywords):
@@ -461,6 +589,13 @@ class AdsFilter:
             if len(kw_lower) < 8:
                 continue
             if kw_lower in self._global_keywords or kw_lower in self._domain_keywords:
+                continue
+            # FIX-B1: Guard RPG content trước khi add
+            if _is_rpg_story_content(kw_lower):
+                logger.warning(
+                    "[AdsFilter] Blocked RPG content from being added as keyword: %r",
+                    kw_lower,
+                )
                 continue
             if use_domain:
                 self._domain_keywords.add(kw_lower)

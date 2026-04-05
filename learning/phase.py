@@ -568,11 +568,18 @@ async def _run_10_ai_calls(
             if s not in dangerous_selectors
         ]
 
-        # Merge ads keywords
-        final_ads = list({
+        # Merge ads keywords — filter qua blacklist trước khi ghi vào profile
+        from utils.ads_filter import _GENERIC_KEYWORD_BLACKLIST, _is_rpg_story_content
+        raw_ads = list({
             *ads_keywords,
             *(ai10.get("ads_keywords") or []),
         })
+        final_ads = [
+            kw for kw in raw_ads
+            if kw.lower().strip() not in _GENERIC_KEYWORD_BLACKLIST
+            and len(kw.strip()) >= 8
+            and not _is_rpg_story_content(kw)
+        ]
 
         # title_selector: ưu tiên AI#10 → consensus → fallback
         final_title = (

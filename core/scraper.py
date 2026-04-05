@@ -480,23 +480,31 @@ async def _finalize_ads(
     output_dir: str,
     cancelled : bool,
 ) -> None:
+    """
+    FIX-B1: auto_candidates giờ CHỈ chứa JS/script injection lines.
+    Tất cả candidates khác đều qua AI verify, kể cả count cao.
+    """
     from ai.agents import ai_verify_ads
 
     domain_slug      = domain.replace(".", "_")
     verified_results : dict[str, bool] = {}
 
     auto_candidates, ai_candidates = ads_filter.get_candidates_by_frequency(
-        auto_threshold = _ADS_AUTO_THRESHOLD,
+        auto_threshold = _ADS_AUTO_THRESHOLD,   # vẫn pass nhưng semantics đã thay đổi
         min_count      = _ADS_AI_MIN_COUNT,
         max_results    = 20,
     )
 
+    # Auto-approve CHỈ cho JS injection lines (không cần AI confirm)
     if auto_candidates:
         added = ads_filter.apply_verified(auto_candidates)
         for line in auto_candidates:
             verified_results[line] = True
         if added > 0:
-            print(f"  [Ads] 🔒 +{added} auto-learned | {ads_filter.stats}", flush=True)
+            print(
+                f"  [Ads] 🔒 +{added} JS injection auto-learned | {ads_filter.stats}",
+                flush=True,
+            )
             await pm.add_ads_to_profile(domain, auto_candidates)
 
     new_suspect_lines = ads_filter.get_new_frequency_suspects(
@@ -526,6 +534,12 @@ async def _finalize_ads(
             raise
         except Exception as e:
             logger.warning("[Ads] AI verify thất bại: %s", e)
+    elif cancelled and all_for_ai:
+        print(
+            f"  [Ads] ⚠ Cancelled — {len(all_for_ai)} candidates chưa verify, "
+            f"đã lưu vào pending review",
+            flush=True,
+        )
 
     ads_filter.save_pending_review(domain_slug, verified_results or None)
     await asyncio.to_thread(ads_filter.save)
