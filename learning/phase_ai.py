@@ -4,6 +4,11 @@ learning/phase_ai.py — 10 AI calls orchestration (tách từ phase.py v2).
 Giữ nguyên hoàn toàn logic 10 AI calls từ phase.py cũ.
 phase.py mới chỉ gọi run_10_ai_calls_internal() và nhận dict kết quả.
 
+Fix L1: xóa local _snippet() — duplicate với ai/agents.py.
+  Import trực tiếp từ ai.agents thay vì định nghĩa lại.
+  ai/agents.py là canonical location cho _snippet vì nó là
+  internal helper của AI layer.
+
 5 phases:
   Phase 1 — Structure Discovery  (AI#1 DOM map, AI#2 cross-check, AI#3 stability)
   Phase 2 — Conflict Resolution  (AI#4 remove audit, AI#5 title deepdive)
@@ -23,17 +28,10 @@ from ai.agents  import (
     ai_remove_audit, ai_title_deepdive, ai_special_content,
     ai_ads_deepscan, ai_nav_stress, ai_full_simulation,
     ai_master_synthesis, resolve_phase1_conflicts,
+    _snippet,   # Fix L1: import từ canonical location thay vì định nghĩa lại
 )
 
 logger = logging.getLogger(__name__)
-
-
-def _snippet(html: str, max_len: int = 10000) -> str:
-    from bs4 import BeautifulSoup
-    soup = BeautifulSoup(html, "html.parser")
-    for t in soup.find_all(["script", "style", "noscript"]):
-        t.decompose()
-    return str(soup)[:max_len]
 
 
 async def run_10_ai_calls_internal(
@@ -85,7 +83,6 @@ async def run_10_ai_calls_internal(
             flush=True,
         )
 
-    # Nếu cả 2 AI#1 và AI#2 đều fail → không đủ để học
     if not ai1 and not ai2:
         print(f"  [Learn] ✗ AI#1 và AI#2 đều thất bại — không thể học", flush=True)
         return None
@@ -188,8 +185,8 @@ async def run_10_ai_calls_internal(
                 if any("<table" in h.lower() for h in htmls):
                     formatting_rules["tables"] = True
         else:
-            formatting_rules["tables"]       = any("<table" in h.lower() for h in htmls)
-            formatting_rules["math_support"]  = False
+            formatting_rules["tables"]      = any("<table" in h.lower() for h in htmls)
+            formatting_rules["math_support"] = False
     else:
         all_results["ai6"] = None
 
@@ -278,52 +275,55 @@ async def run_10_ai_calls_internal(
             s for s in (ai10.get("remove_selectors") or [])
             if s not in dangerous_selectors
         ]
-        final_ads = list({*ads_keywords, *(ai10.get("ads_keywords") or [])})
+        final_ads   = list({*ads_keywords, *(ai10.get("ads_keywords") or [])})
         final_title = (
             ai10.get("chapter_title_selector")
             or consensus.get("chapter_title_selector")
         )
         return {
-            "confidence"           : ai10.get("confidence", 0.7),
-            "content_selector"     : ai10.get("content_selector") or consensus.get("content_selector"),
-            "next_selector"        : ai10.get("next_selector")    or consensus.get("next_selector"),
-            "title_selector"       : final_title,
+            "confidence"            : ai10.get("confidence", 0.7),
+            "content_selector"      : ai10.get("content_selector") or consensus.get("content_selector"),
+            "next_selector"         : ai10.get("next_selector")    or consensus.get("next_selector"),
+            "title_selector"        : final_title,
             "chapter_title_selector": final_title,
-            "remove_selectors"     : final_remove,
-            "nav_type"             : ai10.get("nav_type")         or consensus.get("nav_type"),
-            "chapter_url_pattern"  : ai10.get("chapter_url_pattern") or consensus.get("chapter_url_pattern"),
-            "requires_playwright"  : bool(ai10.get("requires_playwright", False)),
-            "formatting_rules"     : ai10.get("formatting_rules") or formatting_rules,
-            "ads_keywords_learned" : final_ads,
-            "uncertain_fields"     : ai10.get("uncertain_fields", []),
+            "remove_selectors"      : final_remove,
+            "nav_type"              : ai10.get("nav_type")         or consensus.get("nav_type"),
+            "chapter_url_pattern"   : ai10.get("chapter_url_pattern") or consensus.get("chapter_url_pattern"),
+            "requires_playwright"   : bool(ai10.get("requires_playwright", False)),
+            "formatting_rules"      : ai10.get("formatting_rules") or formatting_rules,
+            "ads_keywords_learned"  : final_ads,
+            "uncertain_fields"      : ai10.get("uncertain_fields", []),
         }
     else:
         print(f"  [Learn] ⚠ AI#10 thất bại — dùng consensus", flush=True)
-        final_remove = [s for s in (consensus.get("remove_selectors") or []) if s not in dangerous_selectors]
-        confidence   = _estimate_confidence(all_results, n)
+        final_remove = [
+            s for s in (consensus.get("remove_selectors") or [])
+            if s not in dangerous_selectors
+        ]
+        confidence = _estimate_confidence(all_results, n)
         return {
-            "confidence"           : confidence,
-            "content_selector"     : consensus.get("content_selector"),
-            "next_selector"        : consensus.get("next_selector"),
-            "title_selector"       : consensus.get("chapter_title_selector"),
+            "confidence"            : confidence,
+            "content_selector"      : consensus.get("content_selector"),
+            "next_selector"         : consensus.get("next_selector"),
+            "title_selector"        : consensus.get("chapter_title_selector"),
             "chapter_title_selector": consensus.get("chapter_title_selector"),
-            "remove_selectors"     : final_remove,
-            "nav_type"             : consensus.get("nav_type"),
-            "chapter_url_pattern"  : consensus.get("chapter_url_pattern"),
-            "requires_playwright"  : bool(consensus.get("requires_playwright", False)),
-            "formatting_rules"     : formatting_rules,
-            "ads_keywords_learned" : ads_keywords,
-            "uncertain_fields"     : [],
+            "remove_selectors"      : final_remove,
+            "nav_type"              : consensus.get("nav_type"),
+            "chapter_url_pattern"   : consensus.get("chapter_url_pattern"),
+            "requires_playwright"   : bool(consensus.get("requires_playwright", False)),
+            "formatting_rules"      : formatting_rules,
+            "ads_keywords_learned"  : ads_keywords,
+            "uncertain_fields"      : [],
         }
 
 
 def _build_synthesis_summary(
-    results           : dict,
-    consensus         : dict,
+    results            : dict,
+    consensus          : dict,
     dangerous_selectors: set,
-    ads_keywords      : list,
-    formatting_rules  : dict,
-    n_chapters        : int,
+    ads_keywords       : list,
+    formatting_rules   : dict,
+    n_chapters         : int,
 ) -> str:
     lines: list[str] = []
     lines.append(f"Chapters fetched: {n_chapters}")
@@ -363,7 +363,11 @@ def _estimate_confidence(results: dict, n_chapters: int) -> float:
     scores: list[float] = []
     for key in ("ai3", "ai9", "ai2"):
         r = results.get(key) or {}
-        score_key = "stability_score" if key == "ai3" else "overall_score" if key == "ai9" else "confidence"
+        score_key = (
+            "stability_score" if key == "ai3"
+            else "overall_score" if key == "ai9"
+            else "confidence"
+        )
         if r.get(score_key):
             scores.append(float(r[score_key]))
     base = 0.5 + 0.03 * min(n_chapters, 10)

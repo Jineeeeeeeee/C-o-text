@@ -3,6 +3,9 @@ learning/profile_manager.py — Quản lý SiteProfile per-domain.
 
 Fix #4: add_ads_to_profile() — tính `added` TRƯỚC khi merge vào profile,
   tránh bug cũ luôn trả về 0 do tính sau khi p["ads_keywords_learned"] đã updated.
+
+Fix C3: flush() — đọc và reset _dirty BÊN TRONG lock để tránh race condition
+  khi nhiều coroutines gọi flush() đồng thời.
 """
 from __future__ import annotations
 
@@ -99,15 +102,22 @@ class ProfileManager:
         if added > 0:
             logger.debug("[ProfileManager] +%d ads keywords cho %s", added, domain)
 
-
     async def flush(self) -> None:
-        """Ghi profiles xuống disk nếu có thay đổi chưa lưu (safety net)."""
-        if not self._dirty:
-            return
-        try:
-            async with self._lock:
+        """
+        Ghi profiles xuống disk nếu có thay đổi chưa lưu (safety net).
+
+        Fix C3: _dirty được đọc VÀ reset BÊN TRONG lock.
+        Trước đây _dirty được đọc ngoài lock — nếu 2 coroutines gọi flush()
+        đồng thời, cả hai có thể pass qua `if not self._dirty` rồi cùng ghi
+        disk. Bây giờ coroutine thứ hai sẽ thấy _dirty=False (đã reset bởi
+        coroutine thứ nhất) và return sớm mà không ghi lần nữa.
+        """
+        async with self._lock:
+            if not self._dirty:
+                return
+            try:
                 await save_profiles(self._profiles)
                 self._dirty = False
-            logger.debug("[ProfileManager] Profiles flushed to disk.")
-        except Exception as e:
-            logger.error("[ProfileManager] Flush thất bại: %s", e)
+                logger.debug("[ProfileManager] Profiles flushed to disk.")
+            except Exception as e:
+                logger.error("[ProfileManager] Flush thất bại: %s", e)

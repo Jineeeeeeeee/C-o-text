@@ -4,10 +4,6 @@ pipeline/base.py — Core types và abstract interfaces cho Lego Blocks Pipeline
 v2 changes:
   ARCH-1: RuntimeContext tách biệt hoàn toàn live objects (pool, pw_pool,
           ai_limiter) ra khỏi SiteProfile dict.
-          - SiteProfile = configuration data, serializable, lưu disk.
-          - RuntimeContext = live runtime objects, KHÔNG serialize.
-          Trước đây: ctx.profile["_pool"] = pool  ← anti-pattern
-          Bây giờ:   ctx.runtime.pool             ← clean separation.
 
   ARCH-2: PipelineContext thêm:
           - runtime: RuntimeContext (injected by PipelineRunner)
@@ -15,6 +11,20 @@ v2 changes:
 
   ARCH-3: Blocks KHÔNG được mutate ctx.profile. Side effects phải được
           báo cáo qua BlockResult.metadata để executor xử lý tập trung.
+
+Fix M4: StepConfig.to_dict() / from_dict() round-trip safety.
+  Trước: d.update(self.params) — flat merge. Nếu params có key "type",
+         nó silently overwrite type của step → block sai sau deserialize.
+
+         StepConfig("selector", {"type": "custom"}).to_dict()
+         → {"type": "custom"}   ← "selector" bị mất!
+
+  Sau: nested "params" key — type và params tách biệt hoàn toàn:
+         {"type": "selector", "params": {"selector": "div.content"}}
+
+  Backward compat: from_legacy_dict() đọc format phẳng cũ từ
+  site_profiles.json đã có trên disk. ChainConfig.from_dict() tự detect
+  format và route sang đúng constructor.
 """
 from __future__ import annotations
 
@@ -48,27 +58,18 @@ class BlockStatus(str, Enum):
 class RuntimeContext:
     """
     Live runtime objects — inject một lần mỗi pipeline execution.
-
     KHÔNG serialize, KHÔNG lưu disk, KHÔNG put vào SiteProfile.
-
-    Tất cả blocks truy cập shared resources qua ctx.runtime thay vì
-    ctx.profile["_pool"] (anti-pattern cũ).
-
-    Được tạo bởi PipelineRunner.run() và gán vào ctx.runtime trước khi
-    bất kỳ block nào được chạy.
     """
-    pool:       Any = None   # DomainSessionPool — curl_cffi sessions
-    pw_pool:    Any = None   # PlaywrightPool    — full browser instances
-    ai_limiter: Any = None   # AIRateLimiter     — rate limiter cho Gemini
+    pool:       Any = None
+    pw_pool:    Any = None
+    ai_limiter: Any = None
 
     @classmethod
     def create(cls, pool: Any, pw_pool: Any, ai_limiter: Any) -> "RuntimeContext":
-        """Factory để tạo RuntimeContext từ các dependency đã có sẵn."""
         return cls(pool=pool, pw_pool=pw_pool, ai_limiter=ai_limiter)
 
     @classmethod
     def empty(cls) -> "RuntimeContext":
-        """RuntimeContext trống — dùng cho testing hoặc offline mode."""
         return cls()
 
     @property
@@ -88,24 +89,7 @@ class RuntimeContext:
 
 @dataclass
 class BlockResult:
-    """
-    Kết quả của một block execution.
-
-    Mọi block PHẢI trả về BlockResult — không được raise exception.
-    Exception nên được bắt bên trong block và chuyển thành FAILED result.
-
-    Fields:
-        status:      Trạng thái thực thi (xem BlockStatus)
-        data:        Output của block (nội dung, URL, v.v.)
-        method_used: Tên strategy đã dùng (VD: "rel_next", "selector", "ai")
-        confidence:  0.0-1.0 — mức độ tin cậy của kết quả
-        duration_ms: Thời gian thực thi (ms)
-        char_count:  Số ký tự (cho extract blocks)
-        error:       Mô tả lỗi (chỉ khi status == FAILED)
-        metadata:    Dict tự do cho extra info VÀ signals cho executor.
-                     VD: {"js_heavy": True} → executor xử lý side effect
-                     thay vì block tự mutate ctx.profile.
-    """
+    """Kết quả của một block execution."""
     status:      BlockStatus
     data:        Any        = None
     method_used: str        = ""
@@ -116,14 +100,7 @@ class BlockResult:
     metadata:    dict       = field(default_factory=dict)
 
     @classmethod
-    def success(
-        cls,
-        data       : Any,
-        method_used: str   = "",
-        confidence : float = 1.0,
-        char_count : int   = 0,
-        **metadata,
-    ) -> "BlockResult":
+    def success(cls, data, method_used="", confidence=1.0, char_count=0, **metadata):
         return cls(
             status      = BlockStatus.SUCCESS,
             data        = data,
@@ -134,13 +111,7 @@ class BlockResult:
         )
 
     @classmethod
-    def fallback(
-        cls,
-        data       : Any,
-        method_used: str   = "fallback",
-        confidence : float = 0.6,
-        **metadata,
-    ) -> "BlockResult":
+    def fallback(cls, data, method_used="fallback", confidence=0.6, **metadata):
         return cls(
             status      = BlockStatus.FALLBACK,
             data        = data,
@@ -179,59 +150,32 @@ class BlockResult:
 
 @dataclass
 class PipelineContext:
-    """
-    Shared mutable state flowing through the entire pipeline for ONE chapter.
-
-    Lifecycle:
-        1. PipelineRunner tạo ctx, inject ctx.runtime
-        2. Fetch block  → ctx.html, ctx.status_code, ctx.fetch_method
-        3. (build_soup) → ctx.soup (cleaned)
-        4. Extract block → ctx.content, ctx.selector_used
-        5. Title block   → ctx.title_clean (majority vote)
-        6. Navigate block → ctx.next_url
-        7. Validate block → ctx.is_valid, ctx.validation_score
-
-    Signals trả về cho caller:
-        detected_js_heavy: True nếu HybridFetchBlock phát hiện site dùng JS.
-                           Caller (scraper.py) sẽ persist vào profile.
-    """
-    # ── Input ─────────────────────────────────────────────────────────────────
+    """Shared mutable state flowing through the entire pipeline for ONE chapter."""
     url:      str
-    profile:  dict = field(default_factory=dict)   # SiteProfile (READ-ONLY cho blocks)
-    progress: dict = field(default_factory=dict)   # ProgressDict
+    profile:  dict = field(default_factory=dict)
+    progress: dict = field(default_factory=dict)
+    runtime:  RuntimeContext = field(default_factory=RuntimeContext.empty)
 
-    # ── Runtime dependencies (injected, NOT serialized) ───────────────────────
-    runtime: RuntimeContext = field(default_factory=RuntimeContext.empty)
-
-    # ── Fetch results ─────────────────────────────────────────────────────────
     html:         str | None = None
     status_code:  int        = 0
     fetch_method: str        = ""
 
-    # ── Parsed DOM ────────────────────────────────────────────────────────────
-    soup: Any = None   # BeautifulSoup | None
+    soup: Any = None
 
-    # ── Extract results ───────────────────────────────────────────────────────
     content:       str | None = None
     title_raw:     str | None = None
     title_clean:   str | None = None
     selector_used: str | None = None
 
-    # ── Navigation results ────────────────────────────────────────────────────
     next_url:   str | None = None
     nav_method: str        = ""
 
-    # ── Validation ────────────────────────────────────────────────────────────
     is_valid:         bool  = False
     validation_score: float = 0.0
     validation_notes: list  = field(default_factory=list)
 
-    # ── Signals cho caller ────────────────────────────────────────────────────
-    # Blocks KHÔNG mutate ctx.profile. Signals được set trên ctx để
-    # caller (PipelineRunner / scraper.py) xử lý side effects tập trung.
     detected_js_heavy: bool = False
 
-    # ── Execution tracking ────────────────────────────────────────────────────
     block_results:     dict  = field(default_factory=dict)
     total_duration_ms: float = 0.0
     errors:            list  = field(default_factory=list)
@@ -243,35 +187,17 @@ class PipelineContext:
             self.errors.append(f"{block_name}: {result.error}")
 
     def get_pipeline_score(self) -> dict[str, float]:
-        """
-        Tính pipeline score từ tất cả block results.
-
-        Returns:
-            quality:    Chất lượng nội dung (0-1)
-            speed:      Tốc độ thực thi (0-1, cao = nhanh)
-            resource:   Tài nguyên sử dụng (0-1, cao = ít dùng)
-            confidence: Độ tin cậy tổng thể (0-1)
-            total:      0.4*quality + 0.3*speed + 0.2*resource + 0.1*confidence
-        """
         quality  = self.validation_score
         speed_ms = max(self.total_duration_ms, 1)
         speed    = min(1.0, max(0.0, 1.0 - (speed_ms - 500) / 4500))
-
         used_pw  = "playwright" in self.fetch_method.lower()
         resource = 0.5 if used_pw else 1.0
-
         confs = [
             r.confidence for r in self.block_results.values()
             if r.ok and r.confidence > 0
         ]
         confidence = sum(confs) / len(confs) if confs else 0.0
-
-        total = (
-            0.4 * quality
-            + 0.3 * speed
-            + 0.2 * resource
-            + 0.1 * confidence
-        )
+        total = 0.4 * quality + 0.3 * speed + 0.2 * resource + 0.1 * confidence
         return {
             "quality":    round(quality,    3),
             "speed":      round(speed,      3),
@@ -284,27 +210,6 @@ class PipelineContext:
 # ── Abstract base class ───────────────────────────────────────────────────────
 
 class ScraperBlock(ABC):
-    """
-    Abstract base class cho mọi block trong pipeline.
-
-    Contract:
-      - execute() KHÔNG raise exception (trừ CancelledError)
-      - execute() KHÔNG mutate ctx.profile
-      - Side effects → báo qua BlockResult.metadata, executor xử lý
-      - Implement to_config() / from_config() để serialize/deserialize
-
-    Pattern chuẩn:
-        result = BlockResult.failed("...")
-        try:
-            ... logic ...
-            result = BlockResult.success(data)
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            result = BlockResult.failed(str(e) or repr(e))
-        return result
-    """
-
     block_type: BlockType = BlockType.FETCH
     name:       str       = "base_block"
 
@@ -323,24 +228,89 @@ class ScraperBlock(ABC):
         return result
 
 
-# ── Chain / Pipeline config (stored in profile) ───────────────────────────────
+# ── StepConfig ────────────────────────────────────────────────────────────────
 
 @dataclass
 class StepConfig:
+    """
+    Config cho một step trong chain.
+
+    Fix M4: to_dict() dùng nested "params" key thay vì flat merge.
+
+    Format mới (v2):
+        {"type": "selector", "params": {"selector": "div.content"}}
+
+    Format cũ (v1, legacy — đọc được qua from_legacy_dict):
+        {"type": "selector", "selector": "div.content"}
+
+    Lý do đổi: flat merge cho phép params["type"] overwrite step type,
+    dẫn đến block sai sau deserialize mà không có warning nào.
+    Nested params hoàn toàn tách biệt type và configuration.
+    """
     type:   str
     params: dict = field(default_factory=dict)
 
+    def __post_init__(self) -> None:
+        # Guard: cảnh báo nếu params vô tình có key "type"
+        # (sẽ không còn gây lỗi sau fix này, nhưng vẫn là code smell)
+        if "type" in self.params:
+            import logging
+            logging.getLogger(__name__).warning(
+                "[StepConfig] params có key 'type' — có thể gây nhầm lẫn. "
+                "step.type=%r, params['type']=%r",
+                self.type, self.params["type"],
+            )
+
     def to_dict(self) -> dict:
-        d = {"type": self.type}
-        d.update(self.params)
-        return d
+        """
+        Serialize sang dict. Format v2: nested params.
+
+        Trước (flat merge — có thể bị overwrite):
+            d = {"type": self.type}
+            d.update(self.params)   ← nguy hiểm nếu params["type"] tồn tại
+
+        Sau (nested — an toàn hoàn toàn):
+            {"type": self.type, "params": self.params}
+        """
+        return {
+            "type"  : self.type,
+            "params": dict(self.params),   # shallow copy để tránh mutation
+        }
 
     @classmethod
     def from_dict(cls, d: dict) -> "StepConfig":
-        t = d.get("type", "unknown")
+        """
+        Deserialize từ dict. Tự detect format v1 (legacy) hoặc v2.
+
+        v2: có "params" key → đọc trực tiếp.
+        v1: không có "params" key → delegate sang from_legacy_dict().
+        """
+        if "params" in d:
+            # Format v2 (mới)
+            return cls(
+                type   = d.get("type", "unknown"),
+                params = dict(d.get("params") or {}),
+            )
+        # Format v1 (legacy) — backward compat cho profiles đã lưu trên disk
+        return cls.from_legacy_dict(d)
+
+    @classmethod
+    def from_legacy_dict(cls, d: dict) -> "StepConfig":
+        """
+        Đọc format v1 (flat dict) từ site_profiles.json cũ trên disk.
+
+        Format v1: {"type": "selector", "selector": "div.content"}
+        → StepConfig("selector", {"selector": "div.content"})
+
+        Không tự động migrate — profile vẫn lưu format v1 cho đến khi
+        learning phase chạy lại và ghi format v2.
+        """
+        t      = d.get("type", "unknown")
         params = {k: v for k, v in d.items() if k != "type"}
         return cls(type=t, params=params)
 
+
+# ── ChainConfig ────────────────────────────────────────────────────────────────
 
 @dataclass
 class ChainConfig:
@@ -355,24 +325,18 @@ class ChainConfig:
 
     @classmethod
     def from_dict(cls, d: dict) -> "ChainConfig":
+        # StepConfig.from_dict() tự detect v1 vs v2 format
         return cls(
             chain_type = d.get("chain_type", ""),
             steps      = [StepConfig.from_dict(s) for s in d.get("steps", [])],
         )
 
 
+# ── PipelineConfig ─────────────────────────────────────────────────────────────
+
 @dataclass
 class PipelineConfig:
-    """
-    Full pipeline configuration cho một domain — lưu vào profile JSON.
-
-    Thay vì:
-        {"content_selector": "div.chapter-content", ...}
-    Bây giờ:
-        {"pipeline": {"fetch_chain": {...}, "extract_chain": {...}, ...}}
-
-    Self-healing: primary step thất bại → chain tự fallback sang step tiếp theo.
-    """
+    """Full pipeline configuration cho một domain — lưu vào profile JSON."""
     domain:            str
     fetch_chain:       ChainConfig = field(default_factory=lambda: ChainConfig("fetch"))
     extract_chain:     ChainConfig = field(default_factory=lambda: ChainConfig("extract"))
@@ -415,10 +379,7 @@ class PipelineConfig:
 
     @classmethod
     def default_for_domain(cls, domain: str) -> "PipelineConfig":
-        """
-        Default pipeline (naive/safe) cho domain mới chưa có profile.
-        Optimizer sẽ thay thế cái này sau khi học xong.
-        """
+        """Default pipeline cho domain mới chưa có profile."""
         return cls(
             domain = domain,
             fetch_chain = ChainConfig("fetch", [

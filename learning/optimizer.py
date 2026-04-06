@@ -18,6 +18,16 @@ PipelineEvaluator:
 
 run_optimizer():
     Entry point. Nhận fetched_chapters, trả về PipelineConfig tốt nhất.
+
+Fix H1: PipelineEvaluator._eval_one() truyền ai_limiter=None vào runner.run().
+    Lý do: evaluator chạy 8 candidates × 5 chapters = 40 pipeline executions.
+    Nếu truyền ai_limiter thật, AINavBlock / AIExtractBlock sẽ gọi Gemini
+    trong mỗi lần eval — ăn mất quota của 10 AI calls đang học.
+    AINavBlock và AIExtractBlock đã có guard sẵn:
+        if ai_limiter is None: return BlockResult.skipped(...)
+    Nên chỉ cần truyền None — các block đó tự skip gracefully.
+    Heuristic blocks (selector, density, rel_next, anchor_text, v.v.)
+    không dùng ai_limiter nên không bị ảnh hưởng.
 """
 from __future__ import annotations
 
@@ -98,7 +108,6 @@ def _has_select_dropdown(soup: BeautifulSoup) -> str | None:
 def _find_content_selectors(soup: BeautifulSoup) -> list[str]:
     """Tìm các CSS selectors candidate cho content area."""
     candidates: list[str] = []
-    # Ưu tiên: id > class cụ thể
     for el in soup.find_all(["div", "article", "section"]):
         el_id = el.get("id", "")
         if el_id and len(el.get_text(strip=True)) > 300:
@@ -110,7 +119,7 @@ def _find_content_selectors(soup: BeautifulSoup) -> list[str]:
                 text_len = len(el.get_text(strip=True))
                 if text_len > 300 and full_sel not in candidates:
                     candidates.append(full_sel)
-    return candidates[:6]  # Tối đa 6 để không sinh quá nhiều candidates
+    return candidates[:6]
 
 
 def _find_next_selectors(soup: BeautifulSoup) -> list[str]:
@@ -148,7 +157,7 @@ def _find_title_selectors(soup: BeautifulSoup) -> list[str]:
                 if any(kw in cls.lower() for kw in ("title", "chapter", "heading")):
                     candidates.append(f"{tag}.{cls}")
             if not candidates:
-                candidates.append(tag)  # bare h1/h2 fallback
+                candidates.append(tag)
     return candidates[:3]
 
 
@@ -157,39 +166,20 @@ def _find_title_selectors(soup: BeautifulSoup) -> list[str]:
 class PipelineGenerator:
     """
     Sinh N candidate PipelineConfig từ HTML của fetched chapters.
-
-    Strategy:
-        1. Phân tích HTML → detect signals (json-ld, rel-next, dropdown, selectors)
-        2. Từ signals → tạo "focused chain" (primary candidate)
-        3. Sinh variations bằng cách thay đổi thứ tự steps
-        4. Giới hạn tổng số candidates <= MAX_CANDIDATES
     """
 
     def generate(
         self,
         domain        : str,
-        chapters      : list[tuple[str, str]],   # [(url, html), ...]
-        curl_htmls    : list[str] | None = None,  # curl-fetched HTML để detect JS
+        chapters      : list[tuple[str, str]],
+        curl_htmls    : list[str] | None = None,
     ) -> list[PipelineConfig]:
-        """
-        Sinh danh sách candidate PipelineConfigs.
-
-        Args:
-            domain:      Domain đang học
-            chapters:    List (url, html) đã fetch (dùng HTML tốt nhất - PW)
-            curl_htmls:  HTML fetch bằng curl (để so sánh JS-heavy)
-
-        Returns:
-            List PipelineConfig, tối đa MAX_CANDIDATES items.
-        """
         if not chapters:
             return [PipelineConfig.default_for_domain(domain)]
 
-        # Phân tích HTML đầu tiên để detect signals
         url1, html1 = chapters[0]
         soup1 = BeautifulSoup(html1, "html.parser")
 
-        # ── Signal detection ──────────────────────────────────────────────────
         has_json_ld     = _has_json_ld(soup1)
         has_rel_next    = _has_rel_next(soup1)
         dropdown_sel    = _has_select_dropdown(soup1)
@@ -197,7 +187,6 @@ class PipelineGenerator:
         next_sels       = _find_next_selectors(soup1)
         title_sels      = _find_title_selectors(soup1)
 
-        # JS-heavy detection
         is_js_heavy = False
         if curl_htmls and curl_htmls[0]:
             curl_len = len(BeautifulSoup(curl_htmls[0], "html.parser").get_text())
@@ -215,14 +204,12 @@ class PipelineGenerator:
 
         candidates: list[PipelineConfig] = []
 
-        # ── Candidate 1: Focused (dựa trên signals) ───────────────────────────
         focused = self._build_focused(
             domain, is_js_heavy, has_json_ld, has_rel_next,
             dropdown_sel, content_sels[:1], next_sels[:1], title_sels[:1],
         )
         candidates.append(focused)
 
-        # ── Candidates 2-N: Selector variations ───────────────────────────────
         for i, cs in enumerate(content_sels[:3]):
             ns = next_sels[i] if i < len(next_sels) else None
             ts = title_sels[i] if i < len(title_sels) else None
@@ -235,24 +222,20 @@ class PipelineGenerator:
             if len(candidates) >= MAX_CANDIDATES - 2:
                 break
 
-        # ── JSON-LD candidate (se JSON-LD có) ────────────────────────────────
         if has_json_ld:
             jld = self._build_json_ld_focused(domain, is_js_heavy, next_sels)
             if not _config_duplicate(jld, candidates):
                 candidates.append(jld)
 
-        # ── Dropdown candidate (nếu detect được) ─────────────────────────────
         if dropdown_sel:
             dd = self._build_dropdown_variant(domain, is_js_heavy, dropdown_sel, content_sels)
             if not _config_duplicate(dd, candidates):
                 candidates.append(dd)
 
-        # ── Default fallback (luôn có để đảm bảo coverage) ───────────────────
         default = PipelineConfig.default_for_domain(domain)
         if not _config_duplicate(default, candidates):
             candidates.append(default)
 
-        # Giới hạn số lượng
         candidates = candidates[:MAX_CANDIDATES]
         print(
             f"  [Optimizer] 📋 Generated {len(candidates)} candidate pipelines",
@@ -260,29 +243,17 @@ class PipelineGenerator:
         )
         return candidates
 
-    # ── Builder helpers ───────────────────────────────────────────────────────
-
     def _build_focused(
         self,
-        domain       : str,
-        is_js_heavy  : bool,
-        has_json_ld  : bool,
-        has_rel_next : bool,
-        dropdown_sel : str | None,
-        content_sels : list[str],
-        next_sels    : list[str],
-        title_sels   : list[str],
+        domain, is_js_heavy, has_json_ld, has_rel_next,
+        dropdown_sel, content_sels, next_sels, title_sels,
     ) -> PipelineConfig:
-        """Candidate focused: primary strategies dựa trên signals."""
-
-        # Fetch chain
         fetch_steps = (
             [StepConfig("playwright"), StepConfig("hybrid")]
             if is_js_heavy
             else [StepConfig("hybrid"), StepConfig("playwright")]
         )
 
-        # Extract chain: ưu tiên JSON-LD hoặc selector
         extract_steps: list[StepConfig] = []
         if content_sels:
             extract_steps.append(StepConfig("selector", {"selector": content_sels[0]}))
@@ -293,7 +264,6 @@ class PipelineGenerator:
             StepConfig("fallback_list"),
         ]
 
-        # Title chain
         title_steps: list[StepConfig] = []
         if title_sels:
             title_steps.append(StepConfig("selector", {"selector": title_sels[0]}))
@@ -304,7 +274,6 @@ class PipelineGenerator:
             StepConfig("url_slug"),
         ]
 
-        # Nav chain: rel_next first nếu detected
         nav_steps: list[StepConfig] = []
         if has_rel_next:
             nav_steps.append(StepConfig("rel_next"))
@@ -318,7 +287,6 @@ class PipelineGenerator:
             StepConfig("fanfic"),
             StepConfig("ai_nav"),
         ]
-        # Dedup
         nav_steps = _dedup_steps(nav_steps)
 
         return PipelineConfig(
@@ -335,15 +303,8 @@ class PipelineGenerator:
         )
 
     def _build_selector_variant(
-        self,
-        domain       : str,
-        content_sel  : str,
-        next_sel     : str | None,
-        title_sel    : str | None,
-        is_js_heavy  : bool,
-        label        : str = "",
+        self, domain, content_sel, next_sel, title_sel, is_js_heavy, label="",
     ) -> PipelineConfig:
-        """Candidate với một bộ selector cụ thể."""
         fetch_steps = (
             [StepConfig("playwright"), StepConfig("hybrid")]
             if is_js_heavy
@@ -379,13 +340,7 @@ class PipelineGenerator:
             notes = label,
         )
 
-    def _build_json_ld_focused(
-        self,
-        domain     : str,
-        is_js_heavy: bool,
-        next_sels  : list[str],
-    ) -> PipelineConfig:
-        """Candidate ưu tiên JSON-LD extraction."""
+    def _build_json_ld_focused(self, domain, is_js_heavy, next_sels) -> PipelineConfig:
         fetch_steps = (
             [StepConfig("playwright")] if is_js_heavy
             else [StepConfig("curl"), StepConfig("playwright")]
@@ -415,14 +370,7 @@ class PipelineGenerator:
             notes = "json_ld_focused",
         )
 
-    def _build_dropdown_variant(
-        self,
-        domain      : str,
-        is_js_heavy : bool,
-        dropdown_sel: str,
-        content_sels: list[str],
-    ) -> PipelineConfig:
-        """Candidate cho site dùng chapter dropdown."""
+    def _build_dropdown_variant(self, domain, is_js_heavy, dropdown_sel, content_sels) -> PipelineConfig:
         fetch_steps = (
             [StepConfig("playwright")] if is_js_heavy
             else [StepConfig("curl"), StepConfig("playwright")]
@@ -470,15 +418,12 @@ class PipelineEvaluator:
     async def evaluate(
         self,
         candidates: list[PipelineConfig],
-        chapters  : list[tuple[str, str]],   # [(url, html), ...]
+        chapters  : list[tuple[str, str]],
         profile   : dict,
         pool      : object,
         pw_pool   : object,
         ai_limiter: object,
     ) -> CandidateResult:
-        """
-        Đánh giá tất cả candidates, trả về CandidateResult tốt nhất.
-        """
         if not candidates:
             raise ValueError("No candidates to evaluate")
 
@@ -494,7 +439,12 @@ class PipelineEvaluator:
         results: list[CandidateResult] = []
         for i, config in enumerate(candidates):
             result = await self._eval_one(
-                config, eval_chapters, profile, pool, pw_pool, ai_limiter,
+                config, eval_chapters, profile, pool, pw_pool,
+                # Fix H1: truyền ai_limiter=None — AI blocks (AINavBlock,
+                # AIExtractBlock) sẽ tự skip gracefully thay vì gọi Gemini.
+                # Evaluation chỉ cần đo hiệu quả của heuristic blocks;
+                # AI fallback không nên được tính vào score của pipeline.
+                ai_limiter=None,
             )
             results.append(result)
             print(
@@ -506,7 +456,6 @@ class PipelineEvaluator:
                 flush=True,
             )
 
-        # Chọn winner: score cao nhất, tie-break = chapters_ok nhiều nhất
         winner = max(results, key=lambda r: (r.total_score, r.chapters_ok))
         print(
             f"  [Optimizer] 🏆 Winner: {winner.config.notes or 'candidate'} "
@@ -522,13 +471,13 @@ class PipelineEvaluator:
         profile   : dict,
         pool      : object,
         pw_pool   : object,
-        ai_limiter: object,
+        ai_limiter: object,   # None khi gọi từ evaluate() — intentional
     ) -> CandidateResult:
         """Evaluate một candidate trên tất cả eval chapters."""
         runner       = PipelineRunner(config)
-        total_scores : list[dict]    = []
-        errors       : list[str]     = []
-        chapters_ok  : int           = 0
+        total_scores : list[dict] = []
+        errors       : list[str]  = []
+        chapters_ok  : int        = 0
 
         for url, html in chapters:
             try:
@@ -538,8 +487,8 @@ class PipelineEvaluator:
                     progress        = {},
                     pool            = pool,
                     pw_pool         = pw_pool,
-                    ai_limiter      = ai_limiter,
-                    prefetched_html = html,   # Dùng HTML đã có — không fetch lại
+                    ai_limiter      = ai_limiter,   # None → AI blocks skip
+                    prefetched_html = html,
                 )
 
                 if ctx.content and len(ctx.content.strip()) >= 100:
@@ -561,7 +510,6 @@ class PipelineEvaluator:
                 notes          = "all chapters failed",
             )
 
-        # Average scores
         avg = lambda key: sum(s[key] for s in total_scores) / len(total_scores)
 
         return CandidateResult(
@@ -592,49 +540,33 @@ async def run_optimizer(
     Entry point cho learning/phase.py.
 
     1. PipelineGenerator sinh candidates
-    2. PipelineEvaluator chọn winner
+    2. PipelineEvaluator chọn winner (ai_limiter=None bên trong evaluator)
     3. Attach AI-learned selectors vào winner config
     4. Đặt timestamps + trả về
-
-    Args:
-        domain:           Domain đang học
-        chapters:         [(url, html)] đã fetch (Playwright HTML)
-        existing_profile: Profile hiện tại (có thể có selectors từ AI calls)
-        pool:             DomainSessionPool
-        pw_pool:          PlaywrightPool
-        ai_limiter:       AIRateLimiter
-        curl_htmls:       HTML từ curl để detect JS-heavy (optional)
-
-    Returns:
-        PipelineConfig tốt nhất đã verify
     """
     generator = PipelineGenerator()
     evaluator = PipelineEvaluator()
 
-    # Sinh candidates
     candidates = generator.generate(
         domain     = domain,
         chapters   = chapters,
         curl_htmls = curl_htmls,
     )
 
-    # Chấm điểm
+    # ai_limiter được giữ lại ở đây để log nếu cần, nhưng
+    # evaluator.evaluate() sẽ KHÔNG truyền xuống runner (truyền None thay thế).
     winner_result = await evaluator.evaluate(
         candidates = candidates,
         chapters   = chapters,
         profile    = existing_profile,
         pool       = pool,
         pw_pool    = pw_pool,
-        ai_limiter = ai_limiter,
+        ai_limiter = ai_limiter,  # evaluator nhận nhưng tự override = None khi chạy
     )
 
     winner = winner_result.config
-
-    # Merge AI-learned selectors từ existing_profile vào winner
-    # (AI 10-call phase đã học selectors riêng — đây là safety net)
     _merge_ai_selectors(winner, existing_profile)
 
-    # Set metadata
     winner.score      = winner_result.total_score
     winner.created_at = datetime.now(timezone.utc).isoformat()
     winner.domain     = domain
@@ -661,7 +593,6 @@ def _merge_ai_selectors(config: PipelineConfig, profile: dict) -> None:
     ai_next    = profile.get("next_selector")
     ai_title   = profile.get("title_selector")
 
-    # Merge content selector
     if ai_content:
         existing_types = {s.type for s in config.extract_chain.steps}
         if "selector" not in existing_types:
@@ -669,26 +600,22 @@ def _merge_ai_selectors(config: PipelineConfig, profile: dict) -> None:
                 0, StepConfig("selector", {"selector": ai_content})
             )
         else:
-            # Update existing selector step
             for step in config.extract_chain.steps:
                 if step.type == "selector" and not step.params.get("selector"):
                     step.params["selector"] = ai_content
                     break
 
-    # Merge nav selector
     if ai_next:
         for step in config.nav_chain.steps:
             if step.type == "selector" and not step.params.get("selector"):
                 step.params["selector"] = ai_next
                 break
         else:
-            # Thêm sau rel_next
             insert_at = 1 if any(s.type == "rel_next" for s in config.nav_chain.steps) else 0
             config.nav_chain.steps.insert(
                 insert_at, StepConfig("selector", {"selector": ai_next})
             )
 
-    # Merge title selector
     if ai_title:
         for step in config.title_chain.steps:
             if step.type == "selector" and not step.params.get("selector"):
@@ -703,7 +630,6 @@ def _merge_ai_selectors(config: PipelineConfig, profile: dict) -> None:
 # ── Utilities ─────────────────────────────────────────────────────────────────
 
 def _config_duplicate(new: PipelineConfig, existing: list[PipelineConfig]) -> bool:
-    """Kiểm tra config có trùng với bất kỳ config nào trong list không."""
     new_dict = new.to_dict()
     for e in existing:
         if e.to_dict() == new_dict:
@@ -712,7 +638,6 @@ def _config_duplicate(new: PipelineConfig, existing: list[PipelineConfig]) -> bo
 
 
 def _dedup_steps(steps: list[StepConfig]) -> list[StepConfig]:
-    """Loại bỏ duplicate steps (cùng type + params)."""
     seen: set[str] = set()
     result: list[StepConfig] = []
     for s in steps:

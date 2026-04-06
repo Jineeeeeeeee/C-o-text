@@ -8,10 +8,17 @@ Thay đổi so với v2:
   ARCH-3: Phase này giờ là thin orchestrator — logic nặng đã chuyển vào
           learning/optimizer.py và pipeline/*.py.
 
+Fix H2: Đọc CAO_FAST_LEARNING env var.
+  Khi --fast-learning được truyền qua CLI, main.py set CAO_FAST_LEARNING=1.
+  Phase này giờ kiểm tra flag đó và skip run_optimizer() — thay vào đó
+  dùng default pipeline + merge AI selectors thủ công.
+  Tiết kiệm ~30% thời gian learning (không cần eval 8 candidates × 5 chapters).
+
 Flow mới:
   1. Fetch 10 chapters (giữ nguyên)
   2. 10 AI calls học selectors (giữ nguyên — từ phase cũ)
-  3. [NEW] run_optimizer() → sinh 8 candidates → chấm điểm → chọn winner pipeline
+  3. [CONDITIONAL] run_optimizer() nếu KHÔNG có --fast-learning
+     Hoặc: dùng default pipeline + merge AI selectors nếu CÓ --fast-learning
   4. Merge AI selectors vào winner pipeline (optimizer tự xử lý)
   5. Save profile với cả "pipeline" key lẫn selector fields cũ
 
@@ -24,6 +31,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from datetime import datetime, timezone
 from urllib.parse import urlparse
 
@@ -68,6 +76,11 @@ async def run_learning_phase(
     domain = urlparse(start_url).netloc.lower()
     tag    = _dtag(domain)
 
+    # Fix H2: đọc flag từ env — được set bởi main.py khi --fast-learning
+    fast_learning = os.getenv("CAO_FAST_LEARNING") == "1"
+    if fast_learning:
+        print(f"  [{tag}] ⚡ Fast-learning mode: optimizer sẽ bị skip", flush=True)
+
     print(f"\n{'═'*62}", flush=True)
     print(f"  🎓 Deep Learning: {domain}", flush=True)
     print(f"  📚 Fetching {LEARNING_CHAPTERS} chapters...", flush=True)
@@ -95,24 +108,38 @@ async def run_learning_phase(
         print(f"  [{tag}] ⚠ 10 AI calls thất bại — dùng empty profile cho optimizer", flush=True)
         ai_profile = {}
 
-    # ── 3. Optimizer (tìm pipeline tốt nhất) ─────────────────────────────────
-    print(f"\n  [{tag}] 🔧 Pipeline Optimizer...", flush=True)
-    try:
-        pipeline_config = await run_optimizer(
-            domain           = domain,
-            chapters         = chapters,
-            existing_profile = ai_profile,
-            pool             = pool,
-            pw_pool          = pw_pool,
-            ai_limiter       = ai_limiter,
-            curl_htmls       = curl_htmls,
-        )
-    except asyncio.CancelledError:
-        raise
-    except Exception as e:
-        logger.warning("[Phase] Optimizer thất bại: %s — dùng default pipeline", e)
+    # ── 3. Optimizer hoặc fast-learning path ─────────────────────────────────
+    if fast_learning:
+        # Skip optimizer: dùng default pipeline + inject AI selectors thủ công.
+        # Tiết kiệm ~8 candidates × 5 chapters × pipeline overhead.
+        print(f"  [{tag}] ⚡ Fast-learning: skip optimizer, dùng default pipeline", flush=True)
         from pipeline.base import PipelineConfig
+        from learning.optimizer import _merge_ai_selectors
         pipeline_config = PipelineConfig.default_for_domain(domain)
+        _merge_ai_selectors(pipeline_config, ai_profile)
+        pipeline_config.notes = "fast_learning_default"
+        # score = confidence từ AI (optimizer không chạy nên không có eval score)
+        pipeline_config.score = float(ai_profile.get("confidence", 0.5))
+    else:
+        print(f"\n  [{tag}] 🔧 Pipeline Optimizer...", flush=True)
+        try:
+            pipeline_config = await run_optimizer(
+                domain           = domain,
+                chapters         = chapters,
+                existing_profile = ai_profile,
+                pool             = pool,
+                pw_pool          = pw_pool,
+                ai_limiter       = ai_limiter,
+                curl_htmls       = curl_htmls,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning("[Phase] Optimizer thất bại: %s — dùng default pipeline", e)
+            from pipeline.base import PipelineConfig
+            from learning.optimizer import _merge_ai_selectors
+            pipeline_config = PipelineConfig.default_for_domain(domain)
+            _merge_ai_selectors(pipeline_config, ai_profile)
 
     # ── 4. Build final profile ────────────────────────────────────────────────
     profile = _build_final_profile(domain, ai_profile, pipeline_config, n, chapters)
@@ -300,7 +327,7 @@ def _build_final_profile(
 
 
 def _print_summary(tag: str, profile: SiteProfile) -> None:
-    fr = profile.get("formatting_rules") or {}
+    fr       = profile.get("formatting_rules") or {}
     pipeline = profile.get("pipeline") or {}
     score    = profile.get("optimizer_score", 0)
 

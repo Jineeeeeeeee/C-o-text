@@ -894,13 +894,26 @@ async def ai_extract_content(
 ) -> str | None:
     """
     Extract chapter content từ HTML bằng AI — last resort cho AIExtractBlock.
- 
+
     Dùng khi tất cả heuristic blocks (selector, json_ld, density, fallback_list)
     đã thất bại. Gọi Gemini để identify main content.
- 
+
+    Fix M3: bỏ block fallback thứ hai vốn ignore confidence hoàn toàn.
+    Cả hai điều kiện phải thoả — content đủ dài VÀ AI đủ tự tin.
+    AI tự báo confidence=0.0 nghĩa là nó không tìm thấy content thực sự
+    (có thể là nav text, error page, gibberish) — không nên trả về.
+
+    Thresholds:
+        MIN_CHARS      = 150  — tránh trả về snippet quá ngắn
+        MIN_CONFIDENCE = 0.3  — AI phải tối thiểu "hơi tự tin"
+                                (0.3 là thấp nhưng đủ để loại conf=0.0/0.1)
+
     Returns:
         str — chapter content đã extract, hoặc None nếu thất bại.
     """
+    _MIN_CHARS      = 150
+    _MIN_CONFIDENCE = 0.3
+
     prompt = Prompts.extract_content(_snippet(html, 8000), url)
     try:
         text   = await _call(prompt, limiter, _S_EXTRACT_CONTENT)
@@ -908,11 +921,24 @@ async def ai_extract_content(
         if isinstance(result, dict):
             content = (result.get("content") or "").strip()
             conf    = float(result.get("confidence", 0.0))
-            if len(content) >= 150 and conf >= 0.3:
+
+            if len(content) >= _MIN_CHARS and conf >= _MIN_CONFIDENCE:
                 return content
-            if len(content) >= 150:
-                # Content đủ dài nhưng AI không tự tin — vẫn trả về
-                return content
+
+            # Log lý do từ chối để dễ debug
+            if content and len(content) < _MIN_CHARS:
+                print(
+                    f"  [AI extract] ⚠ Từ chối: content quá ngắn"
+                    f" ({len(content)}c < {_MIN_CHARS}c)",
+                    flush=True,
+                )
+            elif content:
+                print(
+                    f"  [AI extract] ⚠ Từ chối: confidence quá thấp"
+                    f" ({conf:.2f} < {_MIN_CONFIDENCE})",
+                    flush=True,
+                )
+
     except asyncio.CancelledError:
         raise
     except Exception as e:

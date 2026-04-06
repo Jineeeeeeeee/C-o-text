@@ -11,11 +11,22 @@ v19 changes vs v18:
 
   SLIM-3: _dtag
           → utils/string_helpers.domain_tag()
-          Circular import với learning/ đã được fix.
 
-  ARCH-1: ctx.detected_js_heavy được xử lý tại đây (orchestrator level)
-          thay vì để HybridFetchBlock tự mutate ctx.profile.
-          Scraper cập nhật profile in-memory, pm.flush() cuối task persist xuống disk.
+  ARCH-1: ctx.detected_js_heavy được xử lý tại đây (orchestrator level).
+
+Fix L4: thay asyncio.shield() bằng _run_protected() trong finally block.
+
+  Vấn đề: asyncio.shield() trong finally của task bị cancel không hoạt động
+  như mong đợi. shield() bảo vệ inner coroutine khỏi cancel, nhưng
+  `await asyncio.shield(coro)` vẫn raise CancelledError ngay lập tức
+  khi task đang bị cancel — inner coro được schedule nhưng không được
+  await đến completion. Kết quả: pm.flush() và _finalize_ads() có thể
+  không hoàn thành, profile và ads data bị mất.
+
+  Fix: _run_protected(coro, timeout) tạo một asyncio.Task riêng biệt
+  hoàn toàn tách khỏi cancellation scope của caller, rồi await task đó
+  với asyncio.wait_for(). Task riêng không bị cancel khi caller bị cancel.
+  timeout đảm bảo không block vô tận nếu flush/finalize bị treo.
 """
 from __future__ import annotations
 
@@ -40,7 +51,6 @@ from utils.ads_filter     import AdsFilter
 from utils.types          import ProgressDict, SiteProfile
 from utils.issue_reporter import IssueReporter
 
-# Extracted helpers
 from core.chapter_writer  import format_chapter_filename, strip_nav_edges
 from core.story_meta      import (
     extract_story_title, build_story_id_regex,
@@ -52,7 +62,6 @@ from learning.profile_manager import ProfileManager
 from ai.client            import AIRateLimiter
 from ai.agents            import ai_classify_and_find, ai_find_first_chapter
 
-# Pipeline
 from pipeline.executor    import run_chapter as pipeline_run_chapter
 from pipeline.context     import context_summary
 
@@ -62,6 +71,47 @@ _ADS_AUTO_THRESHOLD = 10
 _ADS_AI_MIN_COUNT   = 3
 _ADS_FREQ_MIN_FILES = 5
 MAX_EMPTY_STREAK    = 5
+
+# Timeout cho cleanup operations trong finally block.
+# Đủ dài để flush/finalize hoàn thành bình thường,
+# đủ ngắn để không block Ctrl+C quá lâu.
+_FLUSH_TIMEOUT_SEC    = 5.0
+_FINALIZE_TIMEOUT_SEC = 30.0
+
+
+# ── _run_protected ────────────────────────────────────────────────────────────
+
+async def _run_protected(coro, timeout: float, label: str = "") -> None:
+    """
+    Chạy coroutine trong một Task riêng biệt với timeout.
+
+    Fix L4: thay thế asyncio.shield() trong finally block.
+
+    Tại sao Task riêng biệt hoạt động, shield() không:
+      - asyncio.shield(coro): bảo vệ inner coro khỏi cancel, nhưng
+        `await shield(...)` vẫn raise CancelledError ngay khi caller
+        bị cancel → inner coro không được await đến completion.
+      - asyncio.create_task(coro): tạo task hoàn toàn độc lập với
+        cancellation scope của caller. Task này tiếp tục chạy ngay cả
+        khi caller task bị cancel. wait_for() với timeout đảm bảo
+        cleanup không block vô tận.
+
+    Args:
+        coro:    Coroutine cần chạy (flush, finalize, v.v.)
+        timeout: Số giây tối đa chờ trước khi abandon
+        label:   Tên để log nếu timeout/error
+    """
+    task = asyncio.create_task(coro)
+    try:
+        await asyncio.wait_for(asyncio.shield(task), timeout=timeout)
+    except asyncio.TimeoutError:
+        logger.warning("[Scraper] %s timeout sau %.1fs — abandoning", label or "cleanup", timeout)
+        # Không cancel task — để nó tự hoàn thành trong background nếu có thể
+    except asyncio.CancelledError:
+        # Caller bị cancel nhưng task con vẫn tiếp tục — đây là hành vi đúng
+        logger.debug("[Scraper] %s: caller cancelled, task continues in background", label)
+    except Exception as e:
+        logger.warning("[Scraper] %s thất bại: %s", label or "cleanup", e)
 
 
 # ── find_start_chapter ────────────────────────────────────────────────────────
@@ -148,7 +198,6 @@ async def scrape_one_chapter(
             ai_limiter, issue_reporter=issue_reporter,
         )
 
-    # ── Chạy pipeline ─────────────────────────────────────────────────────────
     try:
         ctx = await pipeline_run_chapter(
             url             = url,
@@ -168,8 +217,6 @@ async def scrape_one_chapter(
             issue_reporter.report("BLOCKED", url, detail=err_msg[:120], chapter_num=ch_num)
         raise
 
-    # ── ARCH-1: Xử lý js_heavy signal từ pipeline ─────────────────────────────
-    # Block KHÔNG được mutate profile. Scraper (orchestrator) làm việc này.
     if ctx.detected_js_heavy and not profile.get("requires_playwright"):
         profile["requires_playwright"] = True  # type: ignore[typeddict-unknown-key]
         logger.info(
@@ -177,7 +224,6 @@ async def scrape_one_chapter(
             urlparse(url).netloc,
         )
 
-    # ── Kiểm tra kết quả pipeline ─────────────────────────────────────────────
     html    = ctx.html
     content = ctx.content
     title   = ctx.title_clean or "Unknown Title"
@@ -189,7 +235,6 @@ async def scrape_one_chapter(
         print(f"  [{tag}] 🏁 Hết truyện / junk page", flush=True)
         return None
 
-    # Index page guard
     if not RE_CHAP_URL.search(url) and ctx.soup:
         from core.navigator import detect_page_type
         if detect_page_type(ctx.soup, url) == "index":
@@ -199,7 +244,6 @@ async def scrape_one_chapter(
             await save_progress(progress_path, progress)
             return None
 
-    # Empty content
     if not content or len(content.strip()) < 100:
         ch_hint = progress.get("chapter_count", 0) + 1
         if ctx.selector_used is None:
@@ -214,12 +258,10 @@ async def scrape_one_chapter(
             ai_limiter, html=html, soup=ctx.soup, issue_reporter=issue_reporter,
         )
 
-    # Strip nav edges
     stripped = strip_nav_edges(content)
     if stripped and len(stripped.strip()) >= 100:
         content = stripped
 
-    # Title fallback warning
     if title and re.fullmatch(r"Chapter \d+", title):
         issue_reporter.report(
             "TITLE_FALLBACK", url,
@@ -227,27 +269,23 @@ async def scrape_one_chapter(
             chapter_num=progress.get("chapter_count", 0) + 1,
         )
 
-    # Ads filter
     content = ads_filter.filter(content, chapter_url=url)
 
-    # Fingerprint dedup
     fp = make_fingerprint(content)
     if fp in fingerprints:
         print(f"  [{tag}] ♻  Loop nội dung — dừng", flush=True)
         return None
     fingerprints.add(fp)
 
-    # Story title nếu chưa có
     if not progress.get("story_title") and not progress.get("story_name_clean"):
         if progress.get("chapter_count", 0) == 0 and ctx.soup:
             title_tag = ctx.soup.find("title")
             if title_tag:
-                raw              = title_tag.get_text(strip=True)
-                story_candidate  = extract_story_title(raw)
+                raw             = title_tag.get_text(strip=True)
+                story_candidate = extract_story_title(raw)
                 if story_candidate:
                     progress["story_title"] = normalize_title(story_candidate)
 
-    # Save chapter
     chapter_num = progress.get("chapter_count", 0) + 1
     filename    = format_chapter_filename(chapter_num, title, progress)
     filepath    = os.path.join(output_dir, filename)
@@ -259,7 +297,6 @@ async def scrape_one_chapter(
         chapter_file = filepath,
     )
 
-    # Update progress
     progress["chapter_count"]    = chapter_num
     progress["last_title"]       = title
     progress["last_scraped_url"] = url
@@ -275,7 +312,6 @@ async def scrape_one_chapter(
     )
     issue_reporter.mark_chapter_ok()
 
-    # Next URL
     next_url = ctx.next_url
 
     if not next_url and ctx.soup:
@@ -432,7 +468,6 @@ async def run_novel_task(
     pre_fetched_titles : list[str] = []
     fetched_chapters   : list[tuple[str, str]] = []
 
-    # Migrate profile cũ nếu cần
     if pm.has(domain):
         existing = pm.get(domain)
         from learning.migrator import needs_migration, migrate_profile
@@ -445,7 +480,6 @@ async def run_novel_task(
                 del migrated["pipeline"]  # type: ignore[misc]
                 await pm.save_profile(domain, migrated)  # type: ignore[arg-type]
 
-    # Learning phase
     if not pm.has(domain) or not pm.is_profile_fresh(domain):
         if os.path.exists(progress_path):
             try:
@@ -501,7 +535,6 @@ async def run_novel_task(
         if injected > 0:
             print(f"  [{tag}] [Ads] +{injected} từ profile | {ads_filter.stats}", flush=True)
 
-    # Find start chapter
     try:
         current_url, progress = await find_start_chapter(
             start_url, progress_path, pool, pw_pool, ai_limiter, profile,
@@ -510,7 +543,6 @@ async def run_novel_task(
         print(f"  [{tag}] ❌ Không tìm được điểm bắt đầu: {e}", flush=True)
         return
 
-    # Naming phase
     if not progress.get("naming_done"):
         from learning.naming import run_naming_phase
         naming = await run_naming_phase(
@@ -637,31 +669,30 @@ async def run_novel_task(
 
         issue_reporter.summarize(total)
 
-        try:
-            await asyncio.shield(
-                _finalize_ads(
-                    ads_filter = ads_filter,
-                    domain     = domain,
-                    ai_limiter = ai_limiter,
-                    pm         = pm,
-                    output_dir = actual_output_dir,
-                    cancelled  = _cancelled,
-                )
-            )
-        except asyncio.CancelledError:
-            try:
-                ads_filter.save_pending_review(domain.replace(".", "_"), None)
-                await asyncio.to_thread(ads_filter.save)
-            except Exception:
-                pass
-        except Exception as e:
-            logger.warning("[Finalize] Ads error: %s", e)
+        # Fix L4: dùng _run_protected() thay vì asyncio.shield().
+        # Mỗi cleanup operation chạy trong Task riêng biệt hoàn toàn
+        # tách khỏi cancellation scope của run_novel_task.
+        # _finalize_ads có timeout dài hơn vì có thể gọi AI verify.
+        await _run_protected(
+            _finalize_ads(
+                ads_filter = ads_filter,
+                domain     = domain,
+                ai_limiter = ai_limiter,
+                pm         = pm,
+                output_dir = actual_output_dir,
+                cancelled  = _cancelled,
+            ),
+            timeout = _FINALIZE_TIMEOUT_SEC,
+            label   = "finalize_ads",
+        )
 
-        # pm.flush() persist profile changes (bao gồm requires_playwright từ js_heavy signal)
-        try:
-            await asyncio.shield(pm.flush())
-        except Exception:
-            pass
+        # pm.flush() persist profile changes (bao gồm requires_playwright
+        # từ js_heavy signal). Timeout ngắn vì chỉ là file write.
+        await _run_protected(
+            pm.flush(),
+            timeout = _FLUSH_TIMEOUT_SEC,
+            label   = "pm.flush",
+        )
 
         icon = "✔" if completed else ("🛑" if _cancelled else "⏸")
         print(f"\n  {icon} [{tag}] {label} — {total} chapters\n", flush=True)

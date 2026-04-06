@@ -3,9 +3,16 @@ learning/naming.py — Xác định story name và chapter naming pattern.
 
 run_naming_phase():
   - Nếu có pre_fetched_titles từ Learning Phase → dùng luôn (0 extra fetch)
-  - Nếu không → fetch 3 chapter đầu để lấy raw <title> tags
+  - Nếu không → fetch _NAMING_SAMPLE_SIZE chapters để lấy raw <title> tags
   - Gọi AI để extract story_name, chapter_keyword, has_subtitle
   - Trả về naming dict để merge vào ProgressDict
+
+Fix L3: thống nhất số lượng title samples về _NAMING_SAMPLE_SIZE = 5.
+  Trước đây:
+    - fetch path:        _NAMING_FETCH_COUNT = 3  → AI nhận 3 titles
+    - pre-fetched path:  [:5]                     → AI nhận 5 titles
+  Hai code paths cho AI số lượng data khác nhau → naming quality không nhất quán.
+  Bây giờ cả hai paths đều dùng _NAMING_SAMPLE_SIZE = 5.
 
 Output dict:
   story_name_clean     : str   — "Monster, No, I'm a Cultivator!"
@@ -32,7 +39,10 @@ from ai.agents import ai_extract_naming_rules
 
 logger = logging.getLogger(__name__)
 
-_NAMING_FETCH_COUNT = 3   # số chapter fetch khi không có pre_fetched_titles
+# Fix L3: một hằng số duy nhất cho cả hai paths.
+# 5 titles đủ để AI phân biệt story name vs chapter keyword vs site suffix
+# mà không tốn quá nhiều fetch requests.
+_NAMING_SAMPLE_SIZE: int = 5
 
 
 async def run_naming_phase(
@@ -58,32 +68,42 @@ async def run_naming_phase(
     tag = _dtag(chapter1_url)
 
     if pre_fetched_titles:
-        raw_titles = [t for t in pre_fetched_titles if t][:5]
+        # Fix L3: dùng _NAMING_SAMPLE_SIZE thay vì hardcode [:5]
+        raw_titles = [t for t in pre_fetched_titles if t][:_NAMING_SAMPLE_SIZE]
         print(
-            f"  [{tag}] 🏷  Naming: sử dụng {len(raw_titles)} titles từ Learning Phase",
+            f"  [{tag}] 🏷  Naming: sử dụng {len(raw_titles)} titles"
+            f" từ Learning Phase (max={_NAMING_SAMPLE_SIZE})",
             flush=True,
         )
     else:
+        # Fix L3: fetch đủ _NAMING_SAMPLE_SIZE chapters thay vì chỉ 3
         print(
-            f"  [{tag}] 🏷  Naming: fetch {_NAMING_FETCH_COUNT} chapters để lấy titles...",
+            f"  [{tag}] 🏷  Naming: fetch {_NAMING_SAMPLE_SIZE} chapters"
+            f" để lấy titles...",
             flush=True,
         )
-        raw_titles = await _fetch_titles(chapter1_url, pool, pw_pool, profile)
+        raw_titles = await _fetch_titles(
+            chapter1_url, pool, pw_pool, profile,
+            n=_NAMING_SAMPLE_SIZE,
+        )
 
     if not raw_titles:
         logger.warning("[Naming] Không lấy được titles — dùng fallback output dir")
         return None
 
-    print(f"  [{tag}] 🤖 AI naming: phân tích {len(raw_titles)} titles...", flush=True)
+    print(
+        f"  [{tag}] 🤖 AI naming: phân tích {len(raw_titles)} titles...",
+        flush=True,
+    )
     result = await ai_extract_naming_rules(raw_titles, chapter1_url, ai_limiter)
 
     if not result or not result.get("story_name"):
         logger.warning("[Naming] AI thất bại — dùng fallback output dir")
         return None
 
-    story_name  = result["story_name"].strip()
-    story_slug  = slugify_filename(story_name, max_len=80)
-    output_dir  = os.path.join(OUTPUT_DIR, story_slug)
+    story_name = result["story_name"].strip()
+    story_slug = slugify_filename(story_name, max_len=80)
+    output_dir = os.path.join(OUTPUT_DIR, story_slug)
 
     naming = {
         "story_name_clean"    : story_name,
@@ -111,7 +131,7 @@ async def _fetch_titles(
     pool,
     pw_pool,
     profile      : SiteProfile,
-    n            : int = _NAMING_FETCH_COUNT,
+    n            : int = _NAMING_SAMPLE_SIZE,   # Fix L3: default = hằng số chung
 ) -> list[str]:
     """Fetch n chapters liên tiếp, trả về list raw <title> tag content."""
     titles  : list[str] = []
@@ -129,7 +149,6 @@ async def _fetch_titles(
             if title:
                 titles.append(title)
 
-            # Navigate tới chapter tiếp theo
             if i < n - 1:
                 soup     = BeautifulSoup(html, "html.parser")
                 next_url = find_next_url(soup, current, profile)

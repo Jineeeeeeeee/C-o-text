@@ -6,14 +6,25 @@ v2 changes:
          Trước: score từ LengthValidatorBlock bị xóa sổ hoàn toàn.
          Sau: cả hai blocks contribute, lấy score cao nhất.
 
+Fix M7: ProseRichnessBlock đọc CAO_NO_VALIDATION env var.
+  Khi --no-validation được truyền qua CLI, main.py set CAO_NO_VALIDATION=1.
+  ProseRichnessBlock tự skip (trả về SKIPPED thay vì chạy scoring).
+  LengthValidatorBlock vẫn chạy bình thường — đây là safety net cơ bản
+  để tránh ghi file rỗng, không nên tắt.
+
+  Lý do đặt logic trong block (không phải executor):
+  Block tự quyết định có chạy không dựa trên context của nó.
+  Executor không nên biết về business logic của từng block.
+
 Blocks:
-    LengthValidatorBlock   — content đủ dài (min_chars)
-    ProseRichnessBlock     — content là văn xuôi thật (không phải nav/ads)
+    LengthValidatorBlock   — content đủ dài (min_chars) — LUÔN chạy
+    ProseRichnessBlock     — content là văn xuôi thật — có thể skip qua flag
     FingerprintDedupBlock  — content không trùng lặp chapter đã cào
 """
 from __future__ import annotations
 
 import asyncio
+import os
 import re
 import time
 
@@ -23,7 +34,12 @@ from pipeline.base import BlockType, BlockResult, PipelineContext, ScraperBlock
 # ── 1. Length Validator ───────────────────────────────────────────────────────
 
 class LengthValidatorBlock(ScraperBlock):
-    """content.strip() >= min_chars."""
+    """
+    content.strip() >= min_chars.
+
+    Luôn chạy kể cả khi CAO_NO_VALIDATION=1 — đây là safety net
+    cơ bản để tránh ghi file rỗng hoặc quá ngắn vào disk.
+    """
     block_type = BlockType.VALIDATE
     name       = "length"
 
@@ -46,7 +62,6 @@ class LengthValidatorBlock(ScraperBlock):
             )
 
         score = min(1.0, char_count / 2000)
-        # Dùng max() để không conflict với ProseRichnessBlock
         ctx.validation_score = max(ctx.validation_score, score * 0.5)
         ctx.is_valid         = True
 
@@ -75,6 +90,11 @@ class ProseRichnessBlock(ScraperBlock):
     """
     Content là văn xuôi thật — không phải navigation/ads dump.
 
+    Fix M7: skip toàn bộ nếu CAO_NO_VALIDATION=1 (--no-validation flag).
+    Env var được đọc tại thời điểm execute() — không cache ở __init__
+    để tránh trường hợp flag được set sau khi block đã được khởi tạo
+    (VD: trong test hoặc khi reload config).
+
     Score từ 5 dimensions:
         1. word_count           >= min_word_count
         2. avg_sentence_length  trong prose range [5, 50] words
@@ -94,6 +114,15 @@ class ProseRichnessBlock(ScraperBlock):
 
     async def execute(self, ctx: PipelineContext) -> BlockResult:
         start = time.monotonic()
+
+        # Fix M7: đọc flag tại execute time, không phải init time
+        if os.getenv("CAO_NO_VALIDATION") == "1":
+            # Không set ctx.is_valid = False — giữ nguyên kết quả từ LengthValidatorBlock
+            return self._timed(
+                BlockResult.skipped("CAO_NO_VALIDATION=1 (--no-validation flag)"),
+                start,
+            )
+
         try:
             content = ctx.content or ""
             stripped = content.strip()
@@ -104,7 +133,6 @@ class ProseRichnessBlock(ScraperBlock):
 
             score, notes = self._score_prose(stripped)
 
-            # max() — KHÔNG overwrite score của LengthValidatorBlock
             ctx.validation_score = max(ctx.validation_score, score)
             ctx.validation_notes = notes
             ctx.is_valid         = score >= 0.3
@@ -133,7 +161,7 @@ class ProseRichnessBlock(ScraperBlock):
             return self._timed(BlockResult.failed(str(e) or repr(e)), start)
 
     def _score_prose(self, text: str) -> tuple[float, list[str]]:
-        notes: list[str]   = []
+        notes: list[str]    = []
         scores: list[float] = []
 
         words      = self._WORD_RE.findall(text)
