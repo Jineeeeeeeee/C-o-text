@@ -1,14 +1,18 @@
 """
 core/chapter_writer.py — Chapter filename formatting và content post-processing.
 
-Extracted từ core/scraper.py để giảm God Object.
+Fix P2-11: lru_cache cho _get_chapter_re() thay vì re.compile() trong hot path.
+  format_chapter_filename() gọi re.compile() với cùng chapter_keyword pattern
+  mỗi lần. 1000 chapters = 1000 compilations lãng phí vì chapter_keyword
+  thường không đổi trong suốt 1 story (luôn là "Chapter", "Episode", v.v.).
 
-Public API:
-    format_chapter_filename()   — tạo tên file .md từ chapter number + title
-    strip_nav_edges()           — xóa navigation text ở đầu/cuối content
+  Sau: _get_chapter_re(chapter_kw) được cache bởi lru_cache(maxsize=32).
+  maxsize=32 đủ cho edge cases (user scrape 32 stories với keyword khác nhau
+  cùng lúc). Trong thực tế thường chỉ cần 2-3 entries.
 """
 from __future__ import annotations
 
+import functools
 import re
 
 from utils.string_helpers import slugify_filename
@@ -24,6 +28,28 @@ _RE_WORD_COUNT = re.compile(
 )
 
 _NAV_EDGE_SCAN = 7
+
+
+# ── Cached regex factory ───────────────────────────────────────────────────────
+
+@functools.lru_cache(maxsize=32)
+def _get_chapter_re(chapter_kw: str) -> re.Pattern:
+    """
+    Compile và cache regex cho chapter keyword.
+
+    Fix P2-11: gọi từ format_chapter_filename() — hot path, mỗi chapter.
+    lru_cache đảm bảo mỗi keyword chỉ compile một lần duy nhất.
+
+    Args:
+        chapter_kw: keyword như "Chapter", "Episode", "Ch.", v.v.
+                    Phải là str thuần (không có ký tự đặc biệt regex)
+                    vì được escape bởi re.escape().
+    """
+    kw_esc = re.escape(chapter_kw)
+    return re.compile(
+        rf"(?:{kw_esc})\s*(?P<n>\d+)\s*[-–—:.]?\s*(?P<sub>.*)",
+        re.IGNORECASE,
+    )
 
 
 # ── format_chapter_filename ────────────────────────────────────────────────────
@@ -44,18 +70,8 @@ def format_chapter_filename(
 
     Args:
         chapter_num: Số thứ tự chapter trong progress (1-based)
-        raw_title:   Title thô từ pipeline (có thể có prefix, pipe suffix)
+        raw_title:   Title thô từ pipeline
         progress:    ProgressDict chứa naming rules từ Naming Phase
-
-    Returns:
-        "0005_Chapter5_The_Rise.md" hoặc "0005_Chapter5.md" hoặc "0005_some_title.md"
-
-    Examples:
-        format_chapter_filename(5, "Chapter 5 – The Rise | Royal Road", progress)
-        → "0005_Chapter5_The_Rise.md"
-
-        format_chapter_filename(1, "Prologue: Beginning", progress)
-        → "0001_Prologue_Beginning.md"
     """
     chapter_kw   = (progress.get("chapter_keyword") or "Chapter").strip()
     has_subtitle = bool(progress.get("has_chapter_subtitle", False))
@@ -70,15 +86,11 @@ def format_chapter_filename(
         if lo_title.startswith(lo_prefix):
             title = title[len(prefix_strip):].lstrip(" ,;:-–—")
 
-    # Bóc pipe suffix (VD: " | Royal Road", " | FanFiction.net")
+    # Bóc pipe suffix
     title = _RE_PIPE_SUFFIX.sub("", title).strip()
 
-    kw_esc  = re.escape(chapter_kw)
-    chap_re = re.compile(
-        rf"(?:{kw_esc})\s*(?P<n>\d+)\s*[-–—:.]?\s*(?P<sub>.*)",
-        re.IGNORECASE,
-    )
-    m = chap_re.search(title)
+    # Fix P2-11: dùng cached regex thay vì re.compile() mỗi lần
+    m = _get_chapter_re(chapter_kw).search(title)
 
     if m:
         n       = m.group("n")
@@ -92,7 +104,6 @@ def format_chapter_filename(
         else:
             name = f"{chapter_num:04d}_{chap_id}"
     else:
-        # Fallback: slugify toàn bộ title
         fallback = (title or raw_title).strip()
         name     = f"{chapter_num:04d}_{slugify_filename(fallback, max_len=60)}"
 
@@ -109,12 +120,6 @@ def strip_nav_edges(text: str) -> str:
         - Lines xuất hiện ở CẢ đầu VÀ cuối (repeated navigation)
         - "[1,234 words]" / "[... words]" patterns
         - Lines ngắn chỉ có chữ cái (Prev/Next/TOC labels)
-
-    Args:
-        text: Content đã extract, chưa cleaned
-
-    Returns:
-        Content đã bỏ navigation edges, hoặc text gốc nếu quá ngắn để xử lý.
     """
     lines = text.splitlines()
     n     = len(lines)
@@ -137,7 +142,6 @@ def strip_nav_edges(text: str) -> str:
             return True
         return s in repeated
 
-    # Tìm điểm bắt đầu thật
     start = 0
     for i in range(min(EDGE, n)):
         if _is_nav(lines[i]):
@@ -147,7 +151,6 @@ def strip_nav_edges(text: str) -> str:
     while start < n and not lines[start].strip():
         start += 1
 
-    # Tìm điểm kết thúc thật
     end = n
     for i in range(min(EDGE, n)):
         idx = n - 1 - i

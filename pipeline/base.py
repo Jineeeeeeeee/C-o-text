@@ -1,30 +1,22 @@
 """
 pipeline/base.py — Core types và abstract interfaces cho Lego Blocks Pipeline.
 
-v2 changes:
-  ARCH-1: RuntimeContext tách biệt hoàn toàn live objects (pool, pw_pool,
-          ai_limiter) ra khỏi SiteProfile dict.
+Fix P1-8: làm rõ to_config() là debug/introspection helper, KHÔNG phải
+  serialization path. Serialization thực sự đi qua StepConfig.to_dict().
 
-  ARCH-2: PipelineContext thêm:
-          - runtime: RuntimeContext (injected by PipelineRunner)
-          - detected_js_heavy: bool (signal từ HybridFetchBlock → caller)
+  Trước: abstract method bắt buộc nhưng không có call site nào trong
+  serialization path → developer sửa to_config() sẽ không có tác dụng gì,
+  gây confusion và wasted effort.
 
-  ARCH-3: Blocks KHÔNG được mutate ctx.profile. Side effects phải được
-          báo cáo qua BlockResult.metadata để executor xử lý tập trung.
+  Sau: to_config() giữ nguyên nhưng docstring + comment rõ ràng:
+    - Mục đích: debug / introspection / logging
+    - KHÔNG được gọi bởi executor hay profile persistence
+    - Serialization pipeline: StepConfig.to_dict() → ChainConfig.to_dict()
+      → PipelineConfig.to_dict() → profile JSON
 
-Fix M4: StepConfig.to_dict() / from_dict() round-trip safety.
-  Trước: d.update(self.params) — flat merge. Nếu params có key "type",
-         nó silently overwrite type của step → block sai sau deserialize.
-
-         StepConfig("selector", {"type": "custom"}).to_dict()
-         → {"type": "custom"}   ← "selector" bị mất!
-
-  Sau: nested "params" key — type và params tách biệt hoàn toàn:
-         {"type": "selector", "params": {"selector": "div.content"}}
-
-  Backward compat: from_legacy_dict() đọc format phẳng cũ từ
-  site_profiles.json đã có trên disk. ChainConfig.from_dict() tự detect
-  format và route sang đúng constructor.
+  Không xóa abstract requirement vì to_config() vẫn hữu ích để inspect
+  block config lúc runtime (VD: in ra pipeline đang dùng để debug).
+  Nhưng developer cần biết rõ context nó được dùng ở đâu.
 """
 from __future__ import annotations
 
@@ -89,7 +81,6 @@ class RuntimeContext:
 
 @dataclass
 class BlockResult:
-    """Kết quả của một block execution."""
     status:      BlockStatus
     data:        Any        = None
     method_used: str        = ""
@@ -123,19 +114,11 @@ class BlockResult:
 
     @classmethod
     def failed(cls, error: str, method_used: str = "") -> "BlockResult":
-        return cls(
-            status      = BlockStatus.FAILED,
-            error       = error,
-            method_used = method_used,
-            confidence  = 0.0,
-        )
+        return cls(status=BlockStatus.FAILED, error=error, method_used=method_used, confidence=0.0)
 
     @classmethod
     def skipped(cls, reason: str = "") -> "BlockResult":
-        return cls(
-            status   = BlockStatus.SKIPPED,
-            metadata = {"reason": reason},
-        )
+        return cls(status=BlockStatus.SKIPPED, metadata={"reason": reason})
 
     @property
     def ok(self) -> bool:
@@ -150,7 +133,6 @@ class BlockResult:
 
 @dataclass
 class PipelineContext:
-    """Shared mutable state flowing through the entire pipeline for ONE chapter."""
     url:      str
     profile:  dict = field(default_factory=dict)
     progress: dict = field(default_factory=dict)
@@ -159,8 +141,7 @@ class PipelineContext:
     html:         str | None = None
     status_code:  int        = 0
     fetch_method: str        = ""
-
-    soup: Any = None
+    soup:         Any        = None
 
     content:       str | None = None
     title_raw:     str | None = None
@@ -192,10 +173,7 @@ class PipelineContext:
         speed    = min(1.0, max(0.0, 1.0 - (speed_ms - 500) / 4500))
         used_pw  = "playwright" in self.fetch_method.lower()
         resource = 0.5 if used_pw else 1.0
-        confs = [
-            r.confidence for r in self.block_results.values()
-            if r.ok and r.confidence > 0
-        ]
+        confs    = [r.confidence for r in self.block_results.values() if r.ok and r.confidence > 0]
         confidence = sum(confs) / len(confs) if confs else 0.0
         total = 0.4 * quality + 0.3 * speed + 0.2 * resource + 0.1 * confidence
         return {
@@ -217,7 +195,24 @@ class ScraperBlock(ABC):
     async def execute(self, ctx: PipelineContext) -> BlockResult: ...
 
     @abstractmethod
-    def to_config(self) -> dict: ...
+    def to_config(self) -> dict:
+        """
+        Trả về config dict của block này.
+
+        Fix P1-8: ĐÂY LÀ DEBUG/INTROSPECTION HELPER — không phải serialization path.
+
+        Serialization thực sự:
+            StepConfig.to_dict() → ChainConfig.to_dict() → PipelineConfig.to_dict()
+            → profile JSON trên disk
+
+        to_config() KHÔNG được gọi bởi executor hay profile persistence.
+        Dùng để: logging, debugging, in ra pipeline config đang chạy.
+
+        Nếu bạn sửa to_config() để thay đổi cách block được lưu vào profile,
+        sửa đó sẽ KHÔNG có tác dụng. Bạn cần sửa StepConfig.to_dict() và
+        tương ứng from_config() thay vào đó.
+        """
+        ...
 
     @classmethod
     @abstractmethod
@@ -236,75 +231,33 @@ class StepConfig:
     Config cho một step trong chain.
 
     Fix M4: to_dict() dùng nested "params" key thay vì flat merge.
-
-    Format mới (v2):
-        {"type": "selector", "params": {"selector": "div.content"}}
-
-    Format cũ (v1, legacy — đọc được qua from_legacy_dict):
-        {"type": "selector", "selector": "div.content"}
-
-    Lý do đổi: flat merge cho phép params["type"] overwrite step type,
-    dẫn đến block sai sau deserialize mà không có warning nào.
-    Nested params hoàn toàn tách biệt type và configuration.
+    Format mới (v2): {"type": "selector", "params": {"selector": "div.content"}}
+    Format cũ (v1):  {"type": "selector", "selector": "div.content"}
+    Backward compat qua from_legacy_dict().
     """
     type:   str
     params: dict = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        # Guard: cảnh báo nếu params vô tình có key "type"
-        # (sẽ không còn gây lỗi sau fix này, nhưng vẫn là code smell)
         if "type" in self.params:
-            import logging
-            logging.getLogger(__name__).warning(
+            import logging as _logging
+            _logging.getLogger(__name__).warning(
                 "[StepConfig] params có key 'type' — có thể gây nhầm lẫn. "
                 "step.type=%r, params['type']=%r",
                 self.type, self.params["type"],
             )
 
     def to_dict(self) -> dict:
-        """
-        Serialize sang dict. Format v2: nested params.
-
-        Trước (flat merge — có thể bị overwrite):
-            d = {"type": self.type}
-            d.update(self.params)   ← nguy hiểm nếu params["type"] tồn tại
-
-        Sau (nested — an toàn hoàn toàn):
-            {"type": self.type, "params": self.params}
-        """
-        return {
-            "type"  : self.type,
-            "params": dict(self.params),   # shallow copy để tránh mutation
-        }
+        return {"type": self.type, "params": dict(self.params)}
 
     @classmethod
     def from_dict(cls, d: dict) -> "StepConfig":
-        """
-        Deserialize từ dict. Tự detect format v1 (legacy) hoặc v2.
-
-        v2: có "params" key → đọc trực tiếp.
-        v1: không có "params" key → delegate sang from_legacy_dict().
-        """
         if "params" in d:
-            # Format v2 (mới)
-            return cls(
-                type   = d.get("type", "unknown"),
-                params = dict(d.get("params") or {}),
-            )
-        # Format v1 (legacy) — backward compat cho profiles đã lưu trên disk
+            return cls(type=d.get("type", "unknown"), params=dict(d.get("params") or {}))
         return cls.from_legacy_dict(d)
 
     @classmethod
     def from_legacy_dict(cls, d: dict) -> "StepConfig":
-        """
-        Đọc format v1 (flat dict) từ site_profiles.json cũ trên disk.
-
-        Format v1: {"type": "selector", "selector": "div.content"}
-        → StepConfig("selector", {"selector": "div.content"})
-
-        Không tự động migrate — profile vẫn lưu format v1 cho đến khi
-        learning phase chạy lại và ghi format v2.
-        """
         t      = d.get("type", "unknown")
         params = {k: v for k, v in d.items() if k != "type"}
         return cls(type=t, params=params)
@@ -318,14 +271,10 @@ class ChainConfig:
     steps:      list[StepConfig] = field(default_factory=list)
 
     def to_dict(self) -> dict:
-        return {
-            "chain_type": self.chain_type,
-            "steps":      [s.to_dict() for s in self.steps],
-        }
+        return {"chain_type": self.chain_type, "steps": [s.to_dict() for s in self.steps]}
 
     @classmethod
     def from_dict(cls, d: dict) -> "ChainConfig":
-        # StepConfig.from_dict() tự detect v1 vs v2 format
         return cls(
             chain_type = d.get("chain_type", ""),
             steps      = [StepConfig.from_dict(s) for s in d.get("steps", [])],
@@ -336,7 +285,6 @@ class ChainConfig:
 
 @dataclass
 class PipelineConfig:
-    """Full pipeline configuration cho một domain — lưu vào profile JSON."""
     domain:            str
     fetch_chain:       ChainConfig = field(default_factory=lambda: ChainConfig("fetch"))
     extract_chain:     ChainConfig = field(default_factory=lambda: ChainConfig("extract"))
@@ -379,13 +327,9 @@ class PipelineConfig:
 
     @classmethod
     def default_for_domain(cls, domain: str) -> "PipelineConfig":
-        """Default pipeline cho domain mới chưa có profile."""
         return cls(
-            domain = domain,
-            fetch_chain = ChainConfig("fetch", [
-                StepConfig("hybrid"),
-                StepConfig("playwright"),
-            ]),
+            domain        = domain,
+            fetch_chain   = ChainConfig("fetch", [StepConfig("hybrid"), StepConfig("playwright")]),
             extract_chain = ChainConfig("extract", [
                 StepConfig("selector"),
                 StepConfig("json_ld"),

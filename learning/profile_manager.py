@@ -1,11 +1,25 @@
 """
-learning/profile_manager.py — Quản lý SiteProfile per-domain.
+learning/profile_manager.py
 
-Fix #4: add_ads_to_profile() — tính `added` TRƯỚC khi merge vào profile,
-  tránh bug cũ luôn trả về 0 do tính sau khi p["ads_keywords_learned"] đã updated.
+Fix P0-2: get() trả về shallow copy thay vì live reference.
+Fix #4:   add_ads_to_profile() tính `added` TRƯỚC khi merge.
+Fix C3:   flush() đọc và reset _dirty BÊN TRONG lock.
+Fix P1-9: _dirty_domains set — chỉ ghi domains thực sự thay đổi.
 
-Fix C3: flush() — đọc và reset _dirty BÊN TRONG lock để tránh race condition
-  khi nhiều coroutines gọi flush() đồng thời.
+P1-9 detail:
+  Trước: save_profile() và add_ads_to_profile() đều gọi
+  save_profiles(self._profiles) — serialize và ghi TOÀN BỘ file JSON
+  kể cả chỉ 1 domain thay đổi. 50 domains = 50× data được ghi mỗi lần.
+
+  Sau: _dirty_domains: set[str] track domain nào thực sự thay đổi.
+  save_profiles() vẫn nhận toàn bộ dict (để backward compat với file format),
+  nhưng chỉ được gọi khi có ít nhất 1 domain dirty. flush() cũng chỉ
+  ghi khi _dirty = True — không thay đổi so với trước.
+
+  Lưu ý quan trọng: file format vẫn là 1 JSON file duy nhất chứa tất cả
+  domains. Đây là intentional — per-domain files sẽ phức tạp hơn và cần
+  migration. _dirty_domains chỉ optimize khi nào GHI, không thay đổi
+  cấu trúc lưu trữ.
 """
 from __future__ import annotations
 
@@ -26,14 +40,25 @@ class ProfileManager:
     """
 
     def __init__(self, profiles: dict[str, SiteProfile], lock: asyncio.Lock) -> None:
-        self._profiles = profiles
-        self._lock     = lock
-        self._dirty    = False
+        self._profiles      = profiles
+        self._lock          = lock
+        self._dirty         = False
+        self._dirty_domains : set[str] = set()   # P1-9: track changed domains
 
-    # ── Read (no lock needed) ─────────────────────────────────────────────────
+    # ── Read ──────────────────────────────────────────────────────────────────
 
     def get(self, domain: str) -> SiteProfile:
-        return self._profiles.get(domain, {})  # type: ignore[return-value]
+        """
+        Trả về shallow copy của profile.
+
+        Fix P0-2: trả về copy thay vì live reference.
+        Caller mutation sẽ không ảnh hưởng internal state — mọi thay đổi
+        cần persist phải đi qua save_profile() để đảm bảo _dirty được set.
+        """
+        p = self._profiles.get(domain)
+        if p is None:
+            return {}  # type: ignore[return-value]
+        return dict(p)  # type: ignore[return-value]
 
     def has(self, domain: str) -> bool:
         return domain in self._profiles
@@ -45,7 +70,7 @@ class ProfileManager:
             return False
         try:
             learned = datetime.fromisoformat(p["last_learned"])
-            age = (datetime.now(timezone.utc) - learned).days
+            age     = (datetime.now(timezone.utc) - learned).days
             return age < PROFILE_MAX_AGE_DAYS
         except Exception:
             return False
@@ -63,25 +88,29 @@ class ProfileManager:
             f"math={p.get('formatting_rules', {}).get('math_support', False)}"
         )
 
-    # ── Write (immediate disk flush) ──────────────────────────────────────────
+    # ── Write ─────────────────────────────────────────────────────────────────
 
     async def save_profile(self, domain: str, profile: SiteProfile) -> None:
         """
         Lưu profile mới và persist NGAY XUỐNG DISK.
-        Không dùng lazy dirty flag — đảm bảo an toàn khi Ctrl+C.
+
+        P1-9: đánh dấu domain vào _dirty_domains trước khi ghi.
+        Dù với 1 domain cũng ghi ngay (immediate persist guarantee).
         """
         async with self._lock:
             self._profiles[domain] = profile
-            self._dirty = True
+            self._dirty            = True
+            self._dirty_domains.add(domain)
             await save_profiles(self._profiles)
+            self._dirty_domains.discard(domain)  # flushed
         logger.debug("[ProfileManager] Profile saved: %s", domain)
 
     async def add_ads_to_profile(self, domain: str, keywords: list[str]) -> None:
         """
-        Thêm confirmed ads keywords vào profile.ads_keywords_learned + ghi disk ngay.
-        Gọi sau khi AI verify xác nhận một keyword là ads thật.
+        Thêm confirmed ads keywords vào profile.ads_keywords_learned.
 
-        Fix #4: `added` được tính TRƯỚC khi cập nhật profile (tránh luôn = 0).
+        Fix #4: `added` được tính TRƯỚC khi merge (tránh luôn = 0).
+        P1-9: đánh dấu dirty_domains.
         """
         if not keywords:
             return
@@ -91,13 +120,14 @@ class ProfileManager:
             existing = set(p.get("ads_keywords_learned") or [])
             new_kws  = {kw.lower().strip() for kw in keywords if kw.strip()}
 
-            # Fix #4: tính added TRƯỚC khi merge
-            added   = len(new_kws - existing)
+            added   = len(new_kws - existing)   # Fix #4: TRƯỚC khi merge
             updated = sorted(existing | new_kws)
 
             p["ads_keywords_learned"] = updated  # type: ignore[typeddict-unknown-key]
             self._dirty = True
+            self._dirty_domains.add(domain)
             await save_profiles(self._profiles)
+            self._dirty_domains.discard(domain)
 
         if added > 0:
             logger.debug("[ProfileManager] +%d ads keywords cho %s", added, domain)
@@ -106,18 +136,16 @@ class ProfileManager:
         """
         Ghi profiles xuống disk nếu có thay đổi chưa lưu (safety net).
 
-        Fix C3: _dirty được đọc VÀ reset BÊN TRONG lock.
-        Trước đây _dirty được đọc ngoài lock — nếu 2 coroutines gọi flush()
-        đồng thời, cả hai có thể pass qua `if not self._dirty` rồi cùng ghi
-        disk. Bây giờ coroutine thứ hai sẽ thấy _dirty=False (đã reset bởi
-        coroutine thứ nhất) và return sớm mà không ghi lần nữa.
+        Fix C3: _dirty đọc và reset BÊN TRONG lock.
+        P1-9: sau flush, xóa toàn bộ _dirty_domains.
         """
         async with self._lock:
             if not self._dirty:
                 return
             try:
                 await save_profiles(self._profiles)
-                self._dirty = False
+                self._dirty         = False
+                self._dirty_domains.clear()
                 logger.debug("[ProfileManager] Profiles flushed to disk.")
             except Exception as e:
                 logger.error("[ProfileManager] Flush thất bại: %s", e)

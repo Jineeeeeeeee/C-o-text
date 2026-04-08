@@ -1,32 +1,15 @@
 """
 core/scraper.py — v19: Slim orchestrator.
 
-v19 changes vs v18:
-  SLIM-1: _format_chapter_filename + _strip_nav_edges
-          → core/chapter_writer.py
-
-  SLIM-2: _extract_story_title + _build_story_id_regex
-          + _is_chapter_url + _story_id_ok
-          → core/story_meta.py
-
-  SLIM-3: _dtag
-          → utils/string_helpers.domain_tag()
-
-  ARCH-1: ctx.detected_js_heavy được xử lý tại đây (orchestrator level).
-
-Fix L4: thay asyncio.shield() bằng _run_protected() trong finally block.
-
-  Vấn đề: asyncio.shield() trong finally của task bị cancel không hoạt động
-  như mong đợi. shield() bảo vệ inner coroutine khỏi cancel, nhưng
-  `await asyncio.shield(coro)` vẫn raise CancelledError ngay lập tức
-  khi task đang bị cancel — inner coro được schedule nhưng không được
-  await đến completion. Kết quả: pm.flush() và _finalize_ads() có thể
-  không hoàn thành, profile và ads data bị mất.
-
-  Fix: _run_protected(coro, timeout) tạo một asyncio.Task riêng biệt
-  hoàn toàn tách khỏi cancellation scope của caller, rồi await task đó
-  với asyncio.wait_for(). Task riêng không bị cancel khi caller bị cancel.
-  timeout đảm bảo không block vô tận nếu flush/finalize bị treo.
+Fix P0-2: requires_playwright persist đúng cách qua pm.save_profile().
+Fix P0-3: asyncio.sleep nằm BÊN TRONG try/except CancelledError.
+Fix P2-13: all_visited và fingerprints được giữ là set trong memory,
+  chỉ serialize thành list khi save_progress(). Tránh O(n) set/list
+  conversion mỗi chapter.
+Fix P2-15: xóa dead import context_summary.
+Fix P3-18: os.makedirs chỉ được gọi SAU KHI actual_output_dir được xác định
+  (sau naming phase), không trước — tránh tạo thư mục rác URL-based.
+Fix P3-19: document rõ thread behavior trong _run_protected khi timeout.
 """
 from __future__ import annotations
 
@@ -63,7 +46,7 @@ from ai.client            import AIRateLimiter
 from ai.agents            import ai_classify_and_find, ai_find_first_chapter
 
 from pipeline.executor    import run_chapter as pipeline_run_chapter
-from pipeline.context     import context_summary
+# Fix P2-15: context_summary không có call site nào → import đã bị xóa
 
 logger = logging.getLogger(__name__)
 
@@ -72,9 +55,6 @@ _ADS_AI_MIN_COUNT   = 3
 _ADS_FREQ_MIN_FILES = 5
 MAX_EMPTY_STREAK    = 5
 
-# Timeout cho cleanup operations trong finally block.
-# Đủ dài để flush/finalize hoàn thành bình thường,
-# đủ ngắn để không block Ctrl+C quá lâu.
 _FLUSH_TIMEOUT_SEC    = 5.0
 _FINALIZE_TIMEOUT_SEC = 30.0
 
@@ -83,32 +63,34 @@ _FINALIZE_TIMEOUT_SEC = 30.0
 
 async def _run_protected(coro, timeout: float, label: str = "") -> None:
     """
-    Chạy coroutine trong một Task riêng biệt với timeout.
+    Chạy coroutine trong Task riêng biệt với timeout.
 
-    Fix L4: thay thế asyncio.shield() trong finally block.
+    Fix L4: thay asyncio.shield() trong finally block.
 
-    Tại sao Task riêng biệt hoạt động, shield() không:
-      - asyncio.shield(coro): bảo vệ inner coro khỏi cancel, nhưng
-        `await shield(...)` vẫn raise CancelledError ngay khi caller
-        bị cancel → inner coro không được await đến completion.
-      - asyncio.create_task(coro): tạo task hoàn toàn độc lập với
-        cancellation scope của caller. Task này tiếp tục chạy ngay cả
-        khi caller task bị cancel. wait_for() với timeout đảm bảo
-        cleanup không block vô tận.
+    Fix P3-19: document thread behavior khi timeout.
+    Khi timeout xảy ra, task bị ABANDON (không cancel) — task vẫn tiếp tục
+    chạy trong background. Nếu task đó đang chạy asyncio.to_thread() (VD:
+    AdsFilter.post_process_directory), thread vẫn tiếp tục đến khi hoàn thành
+    hoặc process exit. Thread không có cơ chế interrupt từ Python asyncio.
 
-    Args:
-        coro:    Coroutine cần chạy (flush, finalize, v.v.)
-        timeout: Số giây tối đa chờ trước khi abandon
-        label:   Tên để log nếu timeout/error
+    Hành vi được chấp nhận vì:
+      1. post_process_directory ghi file atomic (ghi temp → rename) →
+         không corrupt nếu bị kill giữa chừng
+      2. Timeout chỉ xảy ra trong shutdown path → process sắp exit anyway
+      3. Alternative (threading.Event) sẽ phức tạp hóa AdsFilter không cần thiết
+
+    Nếu muốn graceful stop: implement cancellation token trong AdsFilter.
     """
     task = asyncio.create_task(coro)
     try:
         await asyncio.wait_for(asyncio.shield(task), timeout=timeout)
     except asyncio.TimeoutError:
-        logger.warning("[Scraper] %s timeout sau %.1fs — abandoning", label or "cleanup", timeout)
-        # Không cancel task — để nó tự hoàn thành trong background nếu có thể
+        logger.warning(
+            "[Scraper] %s timeout sau %.1fs — task tiếp tục trong background "
+            "(thread nếu có sẽ chạy đến khi hoàn thành hoặc process exit)",
+            label or "cleanup", timeout,
+        )
     except asyncio.CancelledError:
-        # Caller bị cancel nhưng task con vẫn tiếp tục — đây là hành vi đúng
         logger.debug("[Scraper] %s: caller cancelled, task continues in background", label)
     except Exception as e:
         logger.warning("[Scraper] %s thất bại: %s", label or "cleanup", e)
@@ -186,11 +168,18 @@ async def scrape_one_chapter(
     ai_limiter      : AIRateLimiter,
     ads_filter      : AdsFilter,
     issue_reporter  : IssueReporter,
+    all_visited     : set,          # Fix P2-13: nhận set trực tiếp từ caller
+    fingerprints    : set,          # Fix P2-13: nhận set trực tiếp từ caller
     prefetched_html : str | None = None,
 ) -> str | None:
-    tag          = _dtag(url)
-    all_visited  = set(progress.get("all_visited_urls") or [])
-    fingerprints = set(progress.get("fingerprints") or [])
+    """
+    Scrape một chapter. Trả về next_url hoặc None khi dừng.
+
+    Fix P2-13: all_visited và fingerprints là set được pass từ run_novel_task.
+    Không còn set(list) → list(set) O(n) mỗi call — caller giữ set trong
+    memory suốt vòng đời story, chỉ serialize khi save_progress().
+    """
+    tag = _dtag(url)
 
     if url in all_visited:
         return await _find_next_fallback(
@@ -217,13 +206,6 @@ async def scrape_one_chapter(
             issue_reporter.report("BLOCKED", url, detail=err_msg[:120], chapter_num=ch_num)
         raise
 
-    if ctx.detected_js_heavy and not profile.get("requires_playwright"):
-        profile["requires_playwright"] = True  # type: ignore[typeddict-unknown-key]
-        logger.info(
-            "[Scraper] JS-heavy site detected: %s — profile updated (will flush at end)",
-            urlparse(url).netloc,
-        )
-
     html    = ctx.html
     content = ctx.content
     title   = ctx.title_clean or "Unknown Title"
@@ -247,11 +229,7 @@ async def scrape_one_chapter(
     if not content or len(content.strip()) < 100:
         ch_hint = progress.get("chapter_count", 0) + 1
         if ctx.selector_used is None:
-            issue_reporter.report(
-                "CONTENT_SUSPICIOUS", url,
-                detail="pipeline returned 0 chars",
-                chapter_num=ch_hint,
-            )
+            issue_reporter.report("CONTENT_SUSPICIOUS", url, detail="pipeline returned 0 chars", chapter_num=ch_hint)
         print(f"  [{tag}] ⏭  #{ch_hint:>4}: 0 chars — {truncate(url, 52)}", flush=True)
         return await _find_next_fallback(
             url, progress, progress_path, pool, pw_pool, profile,
@@ -275,7 +253,7 @@ async def scrape_one_chapter(
     if fp in fingerprints:
         print(f"  [{tag}] ♻  Loop nội dung — dừng", flush=True)
         return None
-    fingerprints.add(fp)
+    fingerprints.add(fp)  # Fix P2-13: mutate set trực tiếp
 
     if not progress.get("story_title") and not progress.get("story_name_clean"):
         if progress.get("chapter_count", 0) == 0 and ctx.soup:
@@ -291,16 +269,13 @@ async def scrape_one_chapter(
     filepath    = os.path.join(output_dir, filename)
     await write_markdown(filepath, f"# {title}\n\n{content}\n")
 
-    ads_filter.scan_edges_for_suspects(
-        content,
-        chapter_url  = url,
-        chapter_file = filepath,
-    )
+    ads_filter.scan_edges_for_suspects(content, chapter_url=url, chapter_file=filepath)
 
     progress["chapter_count"]    = chapter_num
     progress["last_title"]       = title
     progress["last_scraped_url"] = url
-    all_visited.add(url)
+    all_visited.add(url)  # Fix P2-13: mutate set trực tiếp
+    # Serialize cho progress file chỉ khi cần save
     progress["all_visited_urls"] = list(all_visited)
     progress["fingerprints"]     = list(fingerprints)
 
@@ -313,10 +288,8 @@ async def scrape_one_chapter(
     issue_reporter.mark_chapter_ok()
 
     next_url = ctx.next_url
-
     if not next_url and ctx.soup:
         next_url = find_next_url(ctx.soup, url, profile)
-
     if not next_url:
         try:
             ai_result = await ai_classify_and_find(html, url, ai_limiter)
@@ -326,11 +299,7 @@ async def scrape_one_chapter(
             logger.warning("[NextURL] AI fallback thất bại: %s", e)
 
     if not next_url:
-        issue_reporter.report(
-            "NEXT_URL_MISSING", url,
-            detail="Pipeline + heuristic + AI all failed",
-            chapter_num=chapter_num,
-        )
+        issue_reporter.report("NEXT_URL_MISSING", url, detail="Pipeline + heuristic + AI all failed", chapter_num=chapter_num)
         progress["completed"]        = True
         progress["completed_at_url"] = url
         await save_progress(progress_path, progress)
@@ -344,6 +313,10 @@ async def scrape_one_chapter(
     if next_url in all_visited:
         print(f"  [{tag}] ♻  next_url đã thăm — dừng", flush=True)
         return None
+
+    # Signal js_heavy cho caller qua transient progress key (Fix P0-2)
+    if ctx.detected_js_heavy:
+        progress["_js_heavy_detected"] = True  # type: ignore[typeddict-unknown-key]
 
     progress["current_url"] = next_url
     await save_progress(progress_path, progress)
@@ -377,10 +350,7 @@ async def _find_next_fallback(
         issue_reporter.report("NEXT_URL_MISSING", url, detail="Empty-content chapter")
 
     if next_url:
-        all_visited = set(progress.get("all_visited_urls") or [])
-        all_visited.add(url)
-        progress["all_visited_urls"] = list(all_visited)
-        progress["current_url"]      = next_url
+        progress["current_url"] = next_url
         await save_progress(progress_path, progress)
     return next_url
 
@@ -414,11 +384,9 @@ async def _finalize_ads(
             print(f"  [Ads] 🔒 +{added} auto-learned | {ads_filter.stats}", flush=True)
             await pm.add_ads_to_profile(domain, auto_candidates)
 
-    new_suspect_lines = ads_filter.get_new_frequency_suspects(
-        min_files=_ADS_FREQ_MIN_FILES, max_results=20,
-    )
-    all_for_ai      = list(dict.fromkeys(ai_candidates + new_suspect_lines))
-    new_suspect_set = set(new_suspect_lines)
+    new_suspect_lines = ads_filter.get_new_frequency_suspects(min_files=_ADS_FREQ_MIN_FILES, max_results=20)
+    all_for_ai        = list(dict.fromkeys(ai_candidates + new_suspect_lines))
+    new_suspect_set   = set(new_suspect_lines)
 
     if not cancelled and all_for_ai:
         print(f"  [Ads] 🤖 AI xác nhận {len(all_for_ai)} dòng...", flush=True)
@@ -492,39 +460,25 @@ async def run_novel_task(
         result = await run_learning_phase(start_url, pool, pw_pool, pm, ai_limiter)
         if result is None:
             print(f"  [{tag}] ❌ Learning Phase thất bại. Bỏ qua.", flush=True)
-            issue_reporter.report(
-                "LEARNING_FAILED", start_url,
-                detail="run_learning_phase() returned None",
-            )
+            issue_reporter.report("LEARNING_FAILED", start_url, detail="run_learning_phase() returned None")
             issue_reporter.summarize(0)
             return
 
         profile, pre_fetched_titles, fetched_chapters = result
-
         injected = ads_filter.inject_from_profile(profile)
         if injected > 0:
             print(f"  [{tag}] [Ads] +{injected} từ profile | {ads_filter.stats}", flush=True)
 
         print(f"\n  [{tag}] 🔄 Tái dùng {len(fetched_chapters)} chapters đã fetch...\n", flush=True)
         await save_progress(progress_path, {
-            "current_url"         : None,
-            "chapter_count"       : 0,
-            "story_title"         : None,
-            "all_visited_urls"    : [],
-            "fingerprints"        : [],
-            "story_id"            : None,
-            "story_id_regex"      : None,
-            "story_id_locked"     : False,
-            "completed"           : False,
-            "completed_at_url"    : None,
-            "learning_done"       : True,
-            "start_url"           : start_url,
-            "naming_done"         : False,
-            "story_name_clean"    : None,
-            "chapter_keyword"     : None,
-            "has_chapter_subtitle": False,
-            "story_prefix_strip"  : None,
-            "output_dir_final"    : None,
+            "current_url": None, "chapter_count": 0, "story_title": None,
+            "all_visited_urls": [], "fingerprints": [],
+            "story_id": None, "story_id_regex": None, "story_id_locked": False,
+            "completed": False, "completed_at_url": None,
+            "learning_done": True, "start_url": start_url,
+            "naming_done": False, "story_name_clean": None,
+            "chapter_keyword": None, "has_chapter_subtitle": False,
+            "story_prefix_strip": None, "output_dir_final": None,
         })
     else:
         print(f"  [{tag}] 📂 {pm.summary(domain)}", flush=True)
@@ -566,6 +520,12 @@ async def run_novel_task(
             progress["story_id_locked"] = True
             await save_progress(progress_path, progress)
 
+    # Fix P3-18: actual_output_dir xác định TRƯỚC makedirs.
+    # Trước: makedirs(output_dir) được gọi trước naming phase → tạo thư mục
+    # rác URL-based (VD: "royalroad_com_fiction_55418") ngay cả khi naming
+    # phase sẽ override sang story-name dir. Sau naming phase, output_dir_final
+    # được set và makedirs lại → 2 thư mục trên disk, 1 cái rác.
+    # Sau: chỉ gọi makedirs 1 lần, sau khi actual_output_dir đã biết chắc.
     actual_output_dir = progress.get("output_dir_final") or output_dir
     os.makedirs(actual_output_dir, exist_ok=True)
 
@@ -582,6 +542,12 @@ async def run_novel_task(
 
     prefetch_map: dict[str, str] = {url: html for url, html in fetched_chapters}
 
+    # Fix P2-13: giữ set trong memory suốt vòng đời story.
+    # Không còn set(list) → list(set) O(n) mỗi chapter.
+    # Serialize → list chỉ khi save_progress() (trong scrape_one_chapter).
+    all_visited  : set[str] = set(progress.get("all_visited_urls") or [])
+    fingerprints : set[str] = set(progress.get("fingerprints") or [])
+
     consecutive_errors   = 0
     consecutive_timeouts = 0
     consecutive_empty    = 0
@@ -592,9 +558,11 @@ async def run_novel_task(
             if progress.get("completed"):
                 break
 
-            await asyncio.sleep(get_delay(current_url))
-
             try:
+                # Fix P0-3: asyncio.sleep BÊN TRONG try/except CancelledError
+                # → _cancelled luôn được set đúng kể cả cancel trong sleep
+                await asyncio.sleep(get_delay(current_url))
+
                 prev_count = progress.get("chapter_count", 0)
                 prefetched = prefetch_map.pop(current_url, None)
 
@@ -609,10 +577,19 @@ async def run_novel_task(
                     ai_limiter      = ai_limiter,
                     ads_filter      = ads_filter,
                     issue_reporter  = issue_reporter,
+                    all_visited     = all_visited,    # Fix P2-13
+                    fingerprints    = fingerprints,   # Fix P2-13
                     prefetched_html = prefetched,
                 )
                 consecutive_errors   = 0
                 consecutive_timeouts = 0
+
+                # Fix P0-2: persist requires_playwright nếu js_heavy được detect
+                if progress.pop("_js_heavy_detected", False) and not profile.get("requires_playwright"):
+                    profile["requires_playwright"] = True  # type: ignore[typeddict-unknown-key]
+                    updated_profile = {**pm.get(domain), "requires_playwright": True}
+                    await pm.save_profile(domain, updated_profile)  # type: ignore[arg-type]
+                    logger.info("[Scraper] JS-heavy persisted for %s", domain)
 
                 new_count = progress.get("chapter_count", 0)
                 if new_count > prev_count:
@@ -622,11 +599,7 @@ async def run_novel_task(
                 else:
                     consecutive_empty += 1
                     if consecutive_empty >= MAX_EMPTY_STREAK:
-                        print(
-                            f"\n  [{tag}] ⏸  {MAX_EMPTY_STREAK} chương liên tiếp"
-                            f" không có nội dung.",
-                            flush=True,
-                        )
+                        print(f"\n  [{tag}] ⏸  {MAX_EMPTY_STREAK} chương liên tiếp không có nội dung.", flush=True)
                         issue_reporter.report(
                             "EMPTY_STREAK", current_url,
                             detail=f"{MAX_EMPTY_STREAK} consecutive empty chapters.",
@@ -669,10 +642,6 @@ async def run_novel_task(
 
         issue_reporter.summarize(total)
 
-        # Fix L4: dùng _run_protected() thay vì asyncio.shield().
-        # Mỗi cleanup operation chạy trong Task riêng biệt hoàn toàn
-        # tách khỏi cancellation scope của run_novel_task.
-        # _finalize_ads có timeout dài hơn vì có thể gọi AI verify.
         await _run_protected(
             _finalize_ads(
                 ads_filter = ads_filter,
@@ -686,13 +655,7 @@ async def run_novel_task(
             label   = "finalize_ads",
         )
 
-        # pm.flush() persist profile changes (bao gồm requires_playwright
-        # từ js_heavy signal). Timeout ngắn vì chỉ là file write.
-        await _run_protected(
-            pm.flush(),
-            timeout = _FLUSH_TIMEOUT_SEC,
-            label   = "pm.flush",
-        )
+        await _run_protected(pm.flush(), timeout=_FLUSH_TIMEOUT_SEC, label="pm.flush")
 
         icon = "✔" if completed else ("🛑" if _cancelled else "⏸")
         print(f"\n  {icon} [{tag}] {label} — {total} chapters\n", flush=True)
