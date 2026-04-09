@@ -8,6 +8,16 @@ Fix P3-17: đổi curl_htmls: list[str] → curl_html_ch1: str | None.
   còn lại là "" placeholder. Tên ngụ ý list đầy đủ → developer hiểu sai.
   Sau: curl_html_ch1: str | None — tên nói rõ đây là curl HTML của Ch.1 dùng
   để detect JS-heavy. Optimizer nhận str | None thay vì list[str].
+
+FIX-REQUIRESPW: _build_final_profile() giờ set requires_playwright=True
+  khi optimizer chọn pipeline playwright-first, không chỉ dựa vào AI flag.
+  Trước: requires_playwright chỉ từ ai_profile.get("requires_playwright", False).
+         Nếu AI không nhận ra site JS-heavy nhưng optimizer detect được
+         qua curl vs playwright comparison → profile vẫn để requires_playwright=False
+         → mỗi chapter sau phải redo curl→CF→fallback thay vì đi thẳng Playwright.
+  Sau:   Kiểm tra thêm fetch_chain.steps[0].type. Nếu optimizer chọn
+         "playwright" hoặc "playwright_direct" làm step đầu tiên
+         → site thực sự cần Playwright → set requires_playwright=True.
 """
 from __future__ import annotations
 
@@ -239,6 +249,30 @@ def _build_final_profile(
     urls = [url for url, _ in chapters]
     fr   = ai_profile.get("formatting_rules") or {}
 
+    # FIX-REQUIRESPW: Đọc requires_playwright từ CẢ AI flag VÀ optimizer decision.
+    #
+    # Trường hợp cần Playwright:
+    #   A) AI#10 nhận ra site cần JS rendering → ai_profile["requires_playwright"] = True
+    #   B) Optimizer detect JS-heavy qua curl vs playwright comparison
+    #      → chọn pipeline playwright-first (steps[0].type == "playwright")
+    #      → profile cần reflect điều này để mọi chapter sau không waste curl attempt
+    #
+    # Nếu chỉ đọc ai_profile case (A), case (B) bị bỏ sót:
+    # - Mỗi chapter: HybridFetchBlock thử curl → curl fail/CF → fallback Playwright
+    # - Tốn time, tốn requests, risk rate limit
+    # - Đúng ra nên đi thẳng Playwright từ đầu
+    fetch_steps        = pipeline_config.fetch_chain.steps
+    optimizer_wants_pw = bool(
+        fetch_steps and fetch_steps[0].type in ("playwright", "playwright_direct")
+    )
+    requires_pw = bool(ai_profile.get("requires_playwright", False)) or optimizer_wants_pw
+
+    if optimizer_wants_pw and not ai_profile.get("requires_playwright", False):
+        logger.info(
+            "[Phase] %s: requires_playwright=True (optimizer detected JS-heavy, AI missed it)",
+            domain,
+        )
+
     profile: SiteProfile = {
         "domain"               : domain,
         "last_learned"         : datetime.now(timezone.utc).isoformat(),
@@ -249,7 +283,7 @@ def _build_final_profile(
         "remove_selectors"     : ai_profile.get("remove_selectors", []),
         "nav_type"             : ai_profile.get("nav_type"),
         "chapter_url_pattern"  : ai_profile.get("chapter_url_pattern"),
-        "requires_playwright"  : bool(ai_profile.get("requires_playwright", False)),
+        "requires_playwright"  : requires_pw,          # ← FIX-REQUIRESPW
         "formatting_rules"     : fr,
         "ads_keywords_learned" : list(ai_profile.get("ads_keywords_learned") or []),
         "learned_chapters"     : list(range(1, n_chapters + 1)),
@@ -278,6 +312,7 @@ def _print_summary(tag: str, profile: SiteProfile) -> None:
         f"     next_selector     = {profile.get('next_selector')!r}\n"
         f"     remove            = {profile.get('remove_selectors', [])}\n"
         f"     nav_type          = {profile.get('nav_type')!r}\n"
+        f"     requires_pw       = {profile.get('requires_playwright', False)}\n"
         f"     tables/math       = {fr.get('tables', False)} / {fr.get('math_support', False)}\n"
         f"     pipeline.notes    = {pipeline.get('notes')!r}\n"
         f"     ads_kw            = {len(profile.get('ads_keywords_learned', []))}",

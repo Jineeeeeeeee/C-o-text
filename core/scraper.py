@@ -8,6 +8,7 @@ P1-A: HTTP 429 với empty HTML không còn terminate story.
   Sau:  Check status 429 riêng biệt TRƯỚC khi check `is_junk_page`.
         Raise RuntimeError("HTTP 429") để caller's consecutive_errors guard
         xử lý — backoff rồi retry, không dừng ngay.
+        (Hoạt động đúng sau khi Fix FIX-STATUS truyền status_code vào ctx.)
 
 P1-E: Exception trong scrape_one_chapter được wrap với URL context.
   Trước: exception re-raise không có URL → traceback trong run_novel_task
@@ -22,6 +23,13 @@ P2-D: run_novel_task() tách thành 3 private helpers.
     _setup_story()       — naming + story_id + output_dir
     _run_scrape_loop()   — main scrape loop
     run_novel_task()     — orchestrator gọi 3 helpers theo thứ tự
+
+FIX-CANCEL: asyncio.shield() cho save_progress trong except CancelledError.
+  Trước: await save_progress() trực tiếp bên trong except asyncio.CancelledError.
+         Python 3.8+: CancelledError có thể interrupt await ngay lập tức
+         → progress KHÔNG được lưu dù đã vào except block.
+  Sau:  asyncio.shield(save_progress(...)) bảo vệ save khỏi bị cancel.
+        Nếu shield timeout: log warning, raise CancelledError như bình thường.
 """
 from __future__ import annotations
 
@@ -68,6 +76,10 @@ MAX_EMPTY_STREAK    = 5
 
 _FLUSH_TIMEOUT_SEC    = 5.0
 _FINALIZE_TIMEOUT_SEC = 30.0
+
+# FIX-CANCEL: timeout cho save_progress trong CancelledError handler.
+# Đủ ngắn để không delay Ctrl+C quá lâu, đủ dài để ghi file.
+_CANCEL_SAVE_TIMEOUT_SEC = 3.0
 
 
 # ── _run_protected ────────────────────────────────────────────────────────────
@@ -206,10 +218,9 @@ async def scrape_one_chapter(
     html    = ctx.html
     content = ctx.content
 
-    # P1-A: check 429 TRƯỚC is_junk_page — 429 thường trả về body rỗng,
-    # điều kiện `not html` sẽ trigger return None → story dừng vĩnh viễn.
-    # Raise RuntimeError thay vì return None để consecutive_errors guard
-    # trong run_novel_task xử lý: backoff rồi retry.
+    # P1-A: check 429 TRƯỚC is_junk_page.
+    # Hoạt động đúng sau FIX-STATUS: ctx.status_code giờ chứa status thật
+    # từ fetch block thay vì luôn = 200.
     if ctx.status_code == 429:
         raise RuntimeError(f"HTTP 429 rate limited: {url}")
 
@@ -591,6 +602,8 @@ async def _run_scrape_loop(
         1. Chapter-by-chapter scraping với retry logic
         2. js_heavy persistence
         3. Consecutive error/timeout/empty guards
+
+    FIX-CANCEL: asyncio.shield() cho save_progress trong CancelledError handler.
     """
     all_visited  : set[str] = set(progress.get("all_visited_urls") or [])
     fingerprints : set[str] = set(progress.get("fingerprints") or [])
@@ -630,7 +643,7 @@ async def _run_scrape_loop(
                 consecutive_timeouts = 0
 
                 # Persist js_heavy nếu được detect
-                if progress.pop("_js_heavy_detected", False) and not profile.get("requires_playwright"):
+                if progress.pop("_js_heavy_detected", False) and not profile.get("requires_playwright"):  # type: ignore[typeddict-item]
                     profile["requires_playwright"] = True  # type: ignore[typeddict-unknown-key]
                     updated_profile = {**pm.get(domain), "requires_playwright": True}
                     await pm.save_profile(domain, updated_profile)  # type: ignore[arg-type]
@@ -656,8 +669,17 @@ async def _run_scrape_loop(
                 current_url = next_url
 
             except asyncio.CancelledError:
+                # FIX-CANCEL: asyncio.shield() bảo vệ save_progress khỏi bị cancel.
+                # Không có shield: CancelledError có thể interrupt await save_progress
+                # → progress KHÔNG được lưu → mất progress khi Ctrl+C.
                 _cancelled = True
-                await save_progress(progress_path, progress)
+                try:
+                    await asyncio.wait_for(
+                        asyncio.shield(save_progress(progress_path, progress)),
+                        timeout=_CANCEL_SAVE_TIMEOUT_SEC,
+                    )
+                except (asyncio.TimeoutError, Exception) as save_err:
+                    logger.warning("[Scraper] Progress save timeout/error on cancel: %s", save_err)
                 print(f"  [{tag}] 🛑 Cancelled — progress saved", flush=True)
                 raise
 

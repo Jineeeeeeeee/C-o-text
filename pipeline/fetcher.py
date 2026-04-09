@@ -14,6 +14,12 @@ v2 changes:
   P1-B: _JS_CONTENT_RATIO và _JS_MIN_DIFF_CHARS được import từ config.py
         thay vì hardcode tại đây. Một source of truth cho cả project.
 
+  FIX-STATUS: Tất cả BlockResult.success/fallback sau pool.fetch() đều truyền
+        status_code=status vào metadata. Executor đọc qua:
+            ctx.status_code = fetch_result.metadata.get("status_code", 200)
+        Thiếu field này khiến ctx.status_code luôn = 200 → 429/403 guards
+        trong scraper.py là dead code.
+
 Blocks:
     CurlFetchBlock       — curl_cffi Chrome TLS fingerprint (nhanh, ít RAM)
     PlaywrightFetchBlock — Playwright full browser (JS support)
@@ -72,12 +78,14 @@ class CurlFetchBlock(ScraperBlock):
                     start,
                 )
 
+            # FIX-STATUS: truyền status_code vào metadata
             return self._timed(
                 BlockResult.success(
                     data        = html,
                     method_used = "curl",
                     confidence  = 1.0,
                     char_count  = len(html),
+                    status_code = status,
                 ),
                 start,
             )
@@ -121,12 +129,14 @@ class PlaywrightFetchBlock(ScraperBlock):
                     start,
                 )
 
+            # FIX-STATUS: truyền status_code vào metadata
             return self._timed(
                 BlockResult.success(
                     data        = html,
                     method_used = "playwright",
                     confidence  = 1.0,
                     char_count  = len(html),
+                    status_code = status,
                 ),
                 start,
             )
@@ -163,6 +173,7 @@ class HybridFetchBlock(ScraperBlock):
            KHÔNG tự mutate ctx.profile — đó không phải việc của block.
 
     P1-B: threshold _JS_CONTENT_RATIO, _JS_MIN_DIFF_CHARS import từ config.py.
+    FIX-STATUS: tất cả success/fallback paths đều truyền status_code vào metadata.
     """
     block_type = BlockType.FETCH
     name       = "hybrid"
@@ -195,12 +206,14 @@ class HybridFetchBlock(ScraperBlock):
                         BlockResult.failed(f"junk_page status={status}"),
                         start,
                     )
+                # FIX-STATUS
                 return self._timed(
                     BlockResult.success(
                         data        = html,
                         method_used = "playwright_direct",
                         confidence  = 1.0,
                         char_count  = len(html),
+                        status_code = status,
                     ),
                     start,
                 )
@@ -222,12 +235,14 @@ class HybridFetchBlock(ScraperBlock):
                         BlockResult.failed(f"junk_page status={status}"),
                         start,
                     )
+                # FIX-STATUS
                 return self._timed(
                     BlockResult.success(
                         data        = html,
                         method_used = "curl",
                         confidence  = 1.0,
                         char_count  = len(html),
+                        status_code = status,
                     ),
                     start,
                 )
@@ -241,11 +256,13 @@ class HybridFetchBlock(ScraperBlock):
                         BlockResult.failed(f"junk_page status={status} (after CF)"),
                         start,
                     )
+                # FIX-STATUS
                 return self._timed(
                     BlockResult.fallback(
                         data        = html,
                         method_used = "playwright_cf_fallback",
                         confidence  = 0.9,
+                        status_code = status,
                     ),
                     start,
                 )
@@ -263,11 +280,13 @@ class HybridFetchBlock(ScraperBlock):
                             BlockResult.failed(f"junk_page status={status}"),
                             start,
                         )
+                    # FIX-STATUS
                     return self._timed(
                         BlockResult.fallback(
                             data        = html,
                             method_used = "playwright_network_fallback",
                             confidence  = 0.85,
+                            status_code = status,
                         ),
                         start,
                     )
@@ -300,17 +319,19 @@ class HybridFetchBlock(ScraperBlock):
         KHÔNG mutate ctx.profile — đó là việc của executor/caller.
 
         P1-B: dùng _JS_CONTENT_RATIO, _JS_MIN_DIFF_CHARS từ config.py.
+        FIX-STATUS: track status từ cả curl và pw, dùng status của best result.
         """
         from bs4 import BeautifulSoup
 
         curl_html = pw_html = ""
         curl_ok   = pw_ok   = False
+        curl_status = pw_status = 200  # FIX-STATUS: track real status
 
         try:
-            _, curl_html = await pool.fetch(ctx.url)
+            curl_status, curl_html = await pool.fetch(ctx.url)
             curl_ok = (
                 not is_cloudflare_challenge(curl_html)
-                and not is_junk_page(curl_html)
+                and not is_junk_page(curl_html, curl_status)
             )
         except asyncio.CancelledError:
             raise
@@ -318,8 +339,8 @@ class HybridFetchBlock(ScraperBlock):
             pass
 
         try:
-            _, pw_html = await pw_pool.fetch(ctx.url)
-            pw_ok = not is_junk_page(pw_html)
+            pw_status, pw_html = await pw_pool.fetch(ctx.url)
+            pw_ok = not is_junk_page(pw_html, pw_status)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -356,14 +377,17 @@ class HybridFetchBlock(ScraperBlock):
         if curl_ok and is_cloudflare_challenge(curl_html):
             pool.mark_cf_domain(domain)
 
-        best_html   = pw_html   if pw_ok   else curl_html
+        # FIX-STATUS: chọn status của best result
+        best_html   = pw_html    if pw_ok   else curl_html
         best_method = "playwright" if pw_ok else "curl"
+        best_status = pw_status  if pw_ok   else curl_status
 
         return BlockResult.success(
             data        = best_html,
             method_used = f"hybrid_detect_{best_method}",
             confidence  = 1.0,
             char_count  = len(best_html),
+            status_code = best_status,
             js_heavy    = is_js_heavy,
             curl_len    = curl_len,
             pw_len      = pw_len,
