@@ -3,7 +3,18 @@ pipeline/executor.py
 
 Fix P0-1: _make_block() flatten params trước khi truyền vào factory.
 Fix P1-7: PipelineRunner.from_profile() log warning rõ ràng thay vì silent None.
-Fix P2-15: xóa dead import context_summary (không có call site nào trong codebase).
+Fix P2-15: xóa dead import context_summary.
+
+P2-A: _run_title_vote() phân biệt SKIPPED vs FAILED khi candidates rỗng.
+  Trước: return BlockResult.failed("all title blocks failed") bất kể lý do.
+         Developer không biết blocks bị skip (không có soup/profile) hay thật sự
+         fail (có soup nhưng không tìm được title).
+  Sau:  Đếm riêng skipped_count và failed_count. Error message nói rõ:
+         - "all N blocks skipped (no soup or no html?)" — setup problem
+         - "all N blocks failed" — blocks chạy nhưng không tìm được title
+         - "N skipped, M failed" — mix
+        Không thay đổi behavior (vẫn return FAILED status khi không có candidates),
+        chỉ cải thiện observability.
 """
 from __future__ import annotations
 
@@ -40,9 +51,8 @@ def _make_block(chain_type: str, step: StepConfig):
     """
     Factory: tạo block instance từ chain_type + StepConfig.
 
-    Fix P0-1: StepConfig.to_dict() → {"type": "selector", "params": {"selector": "..."}}
-    Tất cả from_config() đọc flat format. Unpack ở đây — single choke-point,
-    fix toàn bộ 5 chain types mà không cần đụng 15+ from_config() methods.
+    Fix P0-1: unpack "params" dict thành flat config trước khi truyền vào
+    factory. Single choke-point — fix toàn bộ 5 chain types.
     """
     _d  = step.to_dict()
     cfg = {"type": _d["type"], **_d.get("params", {})}
@@ -145,9 +155,20 @@ class ChainExecutor:
         return last_result
 
     async def _run_title_vote(self, ctx: PipelineContext) -> BlockResult:
-        """Confidence-weighted vote với dash-normalized keys (Fix M2)."""
+        """
+        Confidence-weighted vote với dash-normalized keys.
+
+        P2-A: đếm riêng skipped_count và failed_count để error message
+        phân biệt được nguyên nhân khi không có candidates:
+          - All SKIPPED → setup problem (no soup, no html)
+          - All FAILED  → blocks chạy nhưng không tìm được title
+          - Mix         → partial failure
+        """
         candidates  : list[str]   = []
         confidences : list[float] = []
+        skipped_count: int = 0
+        failed_count : int = 0
+        total_steps  : int = 0
 
         for step in self.chain.steps:
             try:
@@ -155,6 +176,7 @@ class ChainExecutor:
             except ValueError:
                 continue
 
+            total_steps += 1
             block_key = f"title:{step.type}"
             try:
                 result = await block.execute(ctx)
@@ -164,14 +186,26 @@ class ChainExecutor:
                 result = BlockResult.failed(str(e) or repr(e))
 
             ctx.record(block_key, result)
-            if result.ok and isinstance(result.data, str):
+
+            if result.status == BlockStatus.SKIPPED:
+                skipped_count += 1
+            elif result.status == BlockStatus.FAILED:
+                failed_count += 1
+            elif result.ok and isinstance(result.data, str):
                 title = result.data.strip()
                 if len(title) >= 3:
                     candidates.append(title)
                     confidences.append(result.confidence)
 
         if not candidates:
-            return BlockResult.failed("all title blocks failed")
+            # P2-A: error message phân biệt rõ nguyên nhân
+            if skipped_count == total_steps:
+                msg = f"all {total_steps} title blocks skipped (no soup or no html?)"
+            elif failed_count == total_steps:
+                msg = f"all {total_steps} title blocks failed"
+            else:
+                msg = f"{skipped_count} skipped, {failed_count} failed — no title found"
+            return BlockResult.failed(msg)
 
         vote_weights  : dict[str, float] = {}
         original_case : dict[str, str]   = {}
@@ -273,8 +307,6 @@ class PipelineRunner:
         Tạo PipelineRunner từ profile dict.
 
         Fix P1-7: log warning rõ ràng cho mọi None path.
-        Trước: silent return None → scraping dùng default pipeline không warning
-        → toàn bộ AI-learned selectors bị ignore, impossible to debug.
         """
         domain        = profile.get("domain", "unknown")
         pipeline_data = profile.get("pipeline")

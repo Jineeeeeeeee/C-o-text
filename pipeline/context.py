@@ -1,7 +1,22 @@
 """
 pipeline/context.py — Factory và helpers cho PipelineContext.
 
-Tách ra khỏi base.py để tránh circular imports khi cần import BeautifulSoup.
+P3-C: Giải thích lý do file này tồn tại riêng thay vì merge vào base.py.
+
+Lý do tách ra khỏi base.py:
+    base.py định nghĩa abstract types (ScraperBlock, BlockResult, StepConfig,
+    PipelineConfig, v.v.) và không nên import BeautifulSoup hay bất kỳ
+    heavy dependency nào — base.py được import ở rất nhiều chỗ, thêm
+    BeautifulSoup import vào đó sẽ tăng overhead cho mọi module chỉ cần types.
+
+    context.py import PipelineContext từ base.py và add factory logic trên đó.
+    Caller (executor.py, scraper.py) chỉ cần import từ context.py,
+    không cần biết internals của PipelineContext.
+
+    Circular import prevention:
+    base.py ← pipeline/context.py ← pipeline/executor.py
+    Nếu merge context.py vào base.py, executor.py sẽ phải import từ base.py
+    mà base.py lại cần executor.py types → circular.
 """
 from __future__ import annotations
 
@@ -15,12 +30,12 @@ def make_context(
 ) -> PipelineContext:
     """
     Factory function tạo PipelineContext mới cho một chapter.
-    
+
     Args:
         url:      URL của chapter cần scrape
         profile:  SiteProfile dict (từ profile_manager)
         progress: ProgressDict (từ progress file)
-    
+
     Returns:
         PipelineContext mới, sẵn sàng cho pipeline execution
     """

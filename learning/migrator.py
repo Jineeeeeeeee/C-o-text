@@ -5,16 +5,26 @@ v2 changes:
   MIG-1: Xóa migrate_all() — dead code, không có chỗ nào gọi.
          Caller (scraper.py) gọi migrate_profile() theo từng domain.
 
+  P0-B: needs_migration() sửa để đọc đúng field.
+    Trước: đọc profile.get("pipeline", {}).get("optimizer_version", 1)
+           → field này là version của thuật toán optimizer, không phải
+             version của schema SiteProfile. Hai khái niệm khác nhau.
+    Sau:   đọc profile.get("profile_version", 1) — top-level field trong
+           SiteProfile, được set thành 2 sau khi migrate xong.
+           Đây là source of truth cho migration status.
+
 Format v1 (legacy):
     {
         "domain": "royalroad.com",
         "content_selector": "div.chapter-content",
         ...
+        (không có "profile_version" key, không có "pipeline" key)
     }
 
 Format v2 (pipeline):
     {
         "domain": "royalroad.com",
+        "profile_version": 2,
         "pipeline": {"fetch_chain": {...}, ...},
         "content_selector": "...",   ← giữ lại cho backward compat
         ...
@@ -32,12 +42,29 @@ CURRENT_VERSION = 2
 
 
 def needs_migration(profile: dict) -> bool:
-    """True nếu profile không có "pipeline" key hoặc version < 2."""
+    """
+    True nếu profile cần migrate lên CURRENT_VERSION.
+
+    P0-B: đọc profile.get("profile_version", 1) thay vì
+    profile.get("pipeline", {}).get("optimizer_version", 1).
+
+    Lý do: "profile_version" là field top-level trong SiteProfile, được
+    set thành 2 trong _build_final_profile() sau learning phase hoặc
+    sau migrate_profile(). "optimizer_version" trong pipeline dict là
+    version của optimizer algorithm — không liên quan đến schema migration.
+
+    Edge cases:
+        - profile không có "pipeline" key → cần migrate (v1 legacy)
+        - profile có "pipeline" nhưng profile_version missing → treat as v1
+        - profile có profile_version >= CURRENT_VERSION → không cần migrate
+    """
     if not profile:
         return False
+    # Profile v1 legacy: không bao giờ có "pipeline" key
     if "pipeline" not in profile:
         return True
-    v = profile.get("pipeline", {}).get("optimizer_version", 1)
+    # profile_version là source of truth cho migration status
+    v = profile.get("profile_version", 1)
     return int(v) < CURRENT_VERSION
 
 
@@ -150,7 +177,7 @@ def migrate_profile(profile: dict) -> tuple[dict, bool]:
     migrated                     = dict(profile)
     migrated["pipeline"]         = pipeline_config.to_dict()
     migrated["requires_relearn"] = requires_relearn
-    migrated["profile_version"]  = CURRENT_VERSION
+    migrated["profile_version"]  = CURRENT_VERSION   # P0-B: set top-level version
     migrated["migration_notes"]  = (
         "auto_migrated from v1. "
         + (f"Missing: {missing}. " if missing else "")

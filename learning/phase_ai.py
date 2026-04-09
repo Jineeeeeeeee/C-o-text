@@ -2,8 +2,13 @@
 learning/phase_ai.py — 10 AI calls orchestration.
 
 Fix P1-10: import snippet thay vì _snippet.
-  _snippet đã được rename thành snippet (public) trong ai/agents.py.
-  _snippet = snippet alias vẫn còn nhưng best practice là dùng tên public.
+P1-C: formatting_rules được init với structure đầy đủ TRƯỚC khi AI#6 chạy.
+  Trước: nếu AI#6 thất bại, formatting_rules chỉ có "tables" key từ HTML scan
+         fallback. AI#10 và _build_final_profile() nhận dict thiếu keys
+         → profile có formatting_rules không đủ → MarkdownFormatter crash
+         hoặc dùng sai default.
+  Sau: init với toàn bộ 10 keys + nested dicts. AI#6 khi thành công sẽ
+       update (override), khi thất bại thì default vẫn đúng.
 """
 from __future__ import annotations
 
@@ -17,10 +22,31 @@ from ai.agents  import (
     ai_remove_audit, ai_title_deepdive, ai_special_content,
     ai_ads_deepscan, ai_nav_stress, ai_full_simulation,
     ai_master_synthesis, resolve_phase1_conflicts,
-    snippet,   # Fix P1-10: public name, không còn _snippet
+    snippet,
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _default_formatting_rules() -> dict:
+    """
+    P1-C: trả về formatting_rules dict đầy đủ với safe defaults.
+
+    Tất cả keys mà MarkdownFormatter và _build_final_profile() có thể đọc
+    đều phải có mặt ở đây. Thêm key mới vào đây TRƯỚC KHI dùng trong code.
+    """
+    return {
+        "tables"        : False,
+        "math_support"  : False,
+        "math_format"   : None,
+        "special_symbols": [],
+        "bold_italic"   : True,
+        "hr_dividers"   : True,
+        "image_alt_text": False,
+        "system_box"    : {"found": False, "selectors": [], "convert_to": "blockquote", "prefix": "**System:**"},
+        "hidden_text"   : {"found": False, "selectors": [], "convert_to": "spoiler_tag"},
+        "author_note"   : {"found": False, "selectors": [], "convert_to": "blockquote_note"},
+    }
 
 
 async def run_10_ai_calls_internal(
@@ -148,32 +174,45 @@ async def run_10_ai_calls_internal(
 
     # ── PHASE 3: Content Intelligence ─────────────────────────────────────────
     print(f"\n  [Learn] ━━ Phase 3: Content Intelligence ━━", flush=True)
-    formatting_rules: dict = {}
+
+    # P1-C: init đầy đủ TRƯỚC khi AI#6 chạy. Nếu AI#6 thất bại thì default
+    # vẫn đúng. Nếu thành công thì keys sẽ bị override bên dưới.
+    formatting_rules: dict = _default_formatting_rules()
 
     if n >= 7:
         print(f"  [Learn] 🤖 AI#6: Special content detection (Ch.7)...", flush=True)
         ai6 = await ai_special_content(snippet(htmls[6], 8000), urls[6], ai_limiter)
         all_results["ai6"] = ai6
         if ai6:
+            # Update theo kết quả AI — chỉ override những key AI trả về
             formatting_rules.update({
-                "tables"         : ai6.get("has_tables", False),
-                "math_support"   : ai6.get("has_math", False),
-                "math_format"    : ai6.get("math_format"),
+                "tables"        : ai6.get("has_tables", False),
+                "math_support"  : ai6.get("has_math", False),
+                "math_format"   : ai6.get("math_format"),
                 "special_symbols": ai6.get("special_symbols", []),
-                "bold_italic"    : ai6.get("bold_italic", True),
-                "hr_dividers"    : ai6.get("hr_dividers", True),
-                "image_alt_text" : ai6.get("image_alt_text", False),
+                "bold_italic"   : ai6.get("bold_italic", True),
+                "hr_dividers"   : ai6.get("hr_dividers", True),
+                "image_alt_text": ai6.get("image_alt_text", False),
             })
             for key in ("system_box", "hidden_text", "author_note"):
-                formatting_rules[key] = ai6.get(key, {"found": False, "selectors": []})
+                val = ai6.get(key)
+                if isinstance(val, dict):
+                    # Merge với default — giữ convert_to/prefix nếu AI không trả về
+                    merged = dict(formatting_rules[key])
+                    merged.update(val)
+                    formatting_rules[key] = merged
+            # Sanity check từ HTML
             if not formatting_rules["tables"]:
                 if any("<table" in h.lower() for h in htmls):
                     formatting_rules["tables"] = True
         else:
-            formatting_rules["tables"]       = any("<table" in h.lower() for h in htmls)
-            formatting_rules["math_support"]  = False
+            # AI#6 thất bại — fallback chỉ cần check tables từ HTML
+            # Các keys khác đã có default từ _default_formatting_rules()
+            formatting_rules["tables"] = any("<table" in h.lower() for h in htmls)
     else:
         all_results["ai6"] = None
+        # Với ít chapters, vẫn check tables từ HTML
+        formatting_rules["tables"] = any("<table" in h.lower() for h in htmls)
 
     ads_keywords: list[str] = []
 
@@ -256,6 +295,10 @@ async def run_10_ai_calls_internal(
         final_remove = [s for s in (ai10.get("remove_selectors") or []) if s not in dangerous_selectors]
         final_ads    = list({*ads_keywords, *(ai10.get("ads_keywords") or [])})
         final_title  = ai10.get("chapter_title_selector") or consensus.get("chapter_title_selector")
+        # Merge AI#10 formatting với default — ưu tiên AI#10 nhưng không mất defaults
+        ai10_fr = ai10.get("formatting_rules") or {}
+        merged_fr = dict(formatting_rules)
+        merged_fr.update(ai10_fr)
         return {
             "confidence"            : ai10.get("confidence", 0.7),
             "content_selector"      : ai10.get("content_selector") or consensus.get("content_selector"),
@@ -266,7 +309,7 @@ async def run_10_ai_calls_internal(
             "nav_type"              : ai10.get("nav_type")         or consensus.get("nav_type"),
             "chapter_url_pattern"   : ai10.get("chapter_url_pattern") or consensus.get("chapter_url_pattern"),
             "requires_playwright"   : bool(ai10.get("requires_playwright", False)),
-            "formatting_rules"      : ai10.get("formatting_rules") or formatting_rules,
+            "formatting_rules"      : merged_fr,
             "ads_keywords_learned"  : final_ads,
             "uncertain_fields"      : ai10.get("uncertain_fields", []),
         }
@@ -284,7 +327,7 @@ async def run_10_ai_calls_internal(
             "nav_type"              : consensus.get("nav_type"),
             "chapter_url_pattern"   : consensus.get("chapter_url_pattern"),
             "requires_playwright"   : bool(consensus.get("requires_playwright", False)),
-            "formatting_rules"      : formatting_rules,
+            "formatting_rules"      : formatting_rules,   # P1-C: đầy đủ keys dù AI#6 fail
             "ads_keywords_learned"  : ads_keywords,
             "uncertain_fields"      : [],
         }
@@ -322,13 +365,8 @@ def _build_synthesis_summary(results, consensus, dangerous_selectors, ads_keywor
 
 def _estimate_confidence(results: dict, n_chapters: int) -> float:
     scores: list[float] = []
-    for key in ("ai3", "ai9", "ai2"):
+    for key, score_key in (("ai3", "stability_score"), ("ai9", "overall_score"), ("ai2", "confidence")):
         r = results.get(key) or {}
-        score_key = (
-            "stability_score" if key == "ai3"
-            else "overall_score" if key == "ai9"
-            else "confidence"
-        )
         if r.get(score_key):
             scores.append(float(r[score_key]))
     base = 0.5 + 0.03 * min(n_chapters, 10)

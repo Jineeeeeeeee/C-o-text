@@ -2,23 +2,8 @@
 learning/optimizer.py — Pipeline optimization engine.
 
 Fix P2-12: PipelineEvaluator chạy candidates SONG SONG bằng asyncio.gather().
-  Trước: 8 candidates × 5 chapters = 40 eval runs tuần tự.
-  Comment "tránh race condition" trong code cũ là sai — mỗi eval tạo
-  PipelineContext riêng biệt, không share state, dùng prefetched HTML
-  nên không có network call, không có shared mutable state.
-  Sau: asyncio.gather() → tất cả candidates chạy đồng thời.
-  Learning phase nhanh hơn đáng kể (bounded by slowest candidate, not sum).
-
 Fix P2-16: _score_fetch_strategy() — fetch strategy được tính riêng.
-  Trước: prefetched_html → fetch chain bị skip hoàn toàn → score chỉ đo
-  extract/nav/validate. Optimizer có thể chọn playwright_direct dù curl
-  đủ dùng vì không có penalty nào cho resource usage.
-  Sau: _score_fetch_strategy() tính fetch score độc lập từ profile signals:
-    - requires_playwright=True → score thấp hơn (resource cost)
-    - Playwright trong fetch chain mà không có evidence → penalty
-    - curl first → score cao nhất
-  Score này được inject vào CandidateResult.resource_score và tham gia
-  vào tổng score theo công thức: 0.4*quality + 0.3*speed + 0.2*resource + 0.1*confidence
+P1-B: _CONTENT_JS_RATIO và magic number 500 replaced bằng import từ config.py.
 """
 from __future__ import annotations
 
@@ -30,6 +15,7 @@ from datetime import datetime, timezone
 
 from bs4 import BeautifulSoup
 
+from config import JS_CONTENT_RATIO as _CONTENT_JS_RATIO, JS_MIN_DIFF_CHARS as _JS_MIN_DIFF_CHARS
 from pipeline.base import (
     ChainConfig, PipelineConfig, PipelineContext, StepConfig,
 )
@@ -39,7 +25,11 @@ logger = logging.getLogger(__name__)
 
 MAX_CANDIDATES       = 8
 MIN_CHAPTERS_TO_EVAL = 3
-_CONTENT_JS_RATIO    = 1.5
+
+# ── Keyword lists — module-level constants (P2-F) ─────────────────────────────
+# Tách ra module-level để tune không cần sửa trong function body.
+_CONTENT_KEYWORDS : tuple[str, ...] = ("chapter", "content", "text", "story", "read")
+_TITLE_KEYWORDS   : tuple[str, ...] = ("title", "chapter", "heading")
 
 
 # ── Candidate score record ────────────────────────────────────────────────────
@@ -96,7 +86,7 @@ def _find_content_selectors(soup: BeautifulSoup) -> list[str]:
             candidates.append(f"#{el_id}")
         classes = el.get("class") or []
         for cls in classes:
-            if any(kw in cls.lower() for kw in ("chapter", "content", "text", "story", "read")):
+            if any(kw in cls.lower() for kw in _CONTENT_KEYWORDS):
                 full_sel = f"{el.name}.{cls}"
                 if len(el.get_text(strip=True)) > 300 and full_sel not in candidates:
                     candidates.append(full_sel)
@@ -132,7 +122,7 @@ def _find_title_selectors(soup: BeautifulSoup) -> list[str]:
             if el_id:
                 candidates.append(f"{tag}#{el_id}")
             for cls in classes:
-                if any(kw in cls.lower() for kw in ("title", "chapter", "heading")):
+                if any(kw in cls.lower() for kw in _TITLE_KEYWORDS):
                     candidates.append(f"{tag}.{cls}")
             if not candidates:
                 candidates.append(tag)
@@ -144,19 +134,6 @@ def _find_title_selectors(soup: BeautifulSoup) -> list[str]:
 def _score_fetch_strategy(config: PipelineConfig, is_js_heavy: bool) -> float:
     """
     Fix P2-16: tính resource score cho fetch strategy độc lập với eval content.
-
-    Fetch chain bị skip khi dùng prefetched HTML, nên không thể đo được
-    qua pipeline execution bình thường. Thay vào đó, score dựa trên:
-      - Candidate dùng curl first → resource score cao (0.9-1.0)
-      - Candidate dùng playwright first nhưng site không JS-heavy → penalty
-      - Site IS JS-heavy → playwright là correct choice → không penalty
-
-    Scale:
-        curl first, site not JS-heavy      → 1.0
-        curl first, site JS-heavy          → 0.7  (curl sẽ fail, không ideal)
-        hybrid first                       → 0.85 (adaptive, good default)
-        playwright first, site JS-heavy    → 0.9  (correct choice)
-        playwright first, site not JS-heavy→ 0.4  (overkill, waste resource)
     """
     steps      = config.fetch_chain.steps
     first_type = steps[0].type if steps else "hybrid"
@@ -167,7 +144,7 @@ def _score_fetch_strategy(config: PipelineConfig, is_js_heavy: bool) -> float:
         return 0.85
     if first_type in ("playwright", "playwright_direct"):
         return 0.9 if is_js_heavy else 0.4
-    return 0.7   # unknown type
+    return 0.7
 
 
 # ── PipelineGenerator ─────────────────────────────────────────────────────────
@@ -177,7 +154,7 @@ class PipelineGenerator:
         self,
         domain        : str,
         chapters      : list[tuple[str, str]],
-        curl_html_ch1 : str | None = None,   # Fix P3-17: str | None thay vì list[str]
+        curl_html_ch1 : str | None = None,
     ) -> list[PipelineConfig]:
         if not chapters:
             return [PipelineConfig.default_for_domain(domain)]
@@ -192,11 +169,12 @@ class PipelineGenerator:
         next_sels    = _find_next_selectors(soup1)
         title_sels   = _find_title_selectors(soup1)
 
+        # P1-B: dùng _CONTENT_JS_RATIO, _JS_MIN_DIFF_CHARS từ config
         is_js_heavy = False
         if curl_html_ch1:
             curl_len = len(BeautifulSoup(curl_html_ch1, "html.parser").get_text())
             pw_len   = len(soup1.get_text())
-            if pw_len > curl_len * _CONTENT_JS_RATIO and (pw_len - curl_len) > 500:
+            if pw_len > curl_len * _CONTENT_JS_RATIO and (pw_len - curl_len) > _JS_MIN_DIFF_CHARS:
                 is_js_heavy = True
                 logger.info("[Generator] JS-heavy detected: curl=%d pw=%d", curl_len, pw_len)
 
@@ -353,11 +331,7 @@ class PipelineEvaluator:
     Chạy từng candidate pipeline trên cached HTML chapters.
 
     Fix P2-12: candidates chạy SONG SONG bằng asyncio.gather().
-    Mỗi _eval_one() tạo PipelineContext riêng, dùng prefetched HTML,
-    không có shared state → hoàn toàn safe để parallelize.
-
-    Fix P2-16: resource_score được tính từ _score_fetch_strategy()
-    thay vì từ pipeline execution (fetch chain bị skip với prefetched HTML).
+    Fix P2-16: resource_score được tính từ _score_fetch_strategy().
     """
 
     async def evaluate(
@@ -378,12 +352,10 @@ class PipelineEvaluator:
 
         print(
             f"  [Optimizer] ⚖️  Đánh giá {len(candidates)} candidates "
-            f"trên {n_eval} chapters (song song)...",   # Fix P2-12
+            f"trên {n_eval} chapters (song song)...",
             flush=True,
         )
 
-        # Fix P2-12: asyncio.gather() thay vì sequential loop.
-        # Mỗi coroutine tạo PipelineContext riêng, không share state.
         tasks = [
             self._eval_one(config, eval_chapters, profile, pool, pw_pool,
                            ai_limiter=None, is_js_heavy=is_js_heavy)
@@ -417,7 +389,7 @@ class PipelineEvaluator:
         profile    : dict,
         pool       : object,
         pw_pool    : object,
-        ai_limiter : object,   # intentionally None from evaluate()
+        ai_limiter : object,
         is_js_heavy: bool = False,
     ) -> CandidateResult:
         runner       = PipelineRunner(config)
@@ -433,7 +405,7 @@ class PipelineEvaluator:
                     progress        = {},
                     pool            = pool,
                     pw_pool         = pw_pool,
-                    ai_limiter      = ai_limiter,   # None → AI blocks skip
+                    ai_limiter      = ai_limiter,
                     prefetched_html = html,
                 )
                 if ctx.content and len(ctx.content.strip()) >= 100:
@@ -456,16 +428,9 @@ class PipelineEvaluator:
 
         avg = lambda key: sum(s[key] for s in total_scores) / len(total_scores)
 
-        # Fix P2-16: resource_score từ fetch strategy, không phải từ pipeline execution
-        fetch_resource = _score_fetch_strategy(config, is_js_heavy)
-
-        # Blend: pipeline's resource score (from ctx.get_pipeline_score) +
-        # fetch strategy score. Pipeline resource = 0.5 for playwright, 1.0 for curl
-        # (measured via fetch_method string). With prefetched HTML it's always 1.0.
-        # Override with our fetch analysis for correctness.
+        fetch_resource   = _score_fetch_strategy(config, is_js_heavy)
         blended_resource = (avg("resource") * 0.3 + fetch_resource * 0.7)
 
-        # Recompute total với corrected resource score
         quality    = avg("quality")
         speed      = avg("speed")
         confidence = avg("confidence")
@@ -493,17 +458,19 @@ async def run_optimizer(
     pool             : object,
     pw_pool          : object,
     ai_limiter       : object,
-    curl_html_ch1    : str | None = None,   # Fix P3-17
+    curl_html_ch1    : str | None = None,
 ) -> PipelineConfig:
     generator = PipelineGenerator()
     evaluator = PipelineEvaluator()
 
     candidates = generator.generate(domain=domain, chapters=chapters, curl_html_ch1=curl_html_ch1)
 
-    # Detect is_js_heavy để truyền vào evaluator cho P2-16
-    is_js_heavy = bool(curl_html_ch1 and
-                       len(BeautifulSoup(chapters[0][1], "html.parser").get_text()) >
-                       len(BeautifulSoup(curl_html_ch1, "html.parser").get_text()) * _CONTENT_JS_RATIO)
+    # P1-B: dùng _CONTENT_JS_RATIO, _JS_MIN_DIFF_CHARS từ config
+    is_js_heavy = bool(
+        curl_html_ch1
+        and len(BeautifulSoup(chapters[0][1], "html.parser").get_text()) >
+            len(BeautifulSoup(curl_html_ch1, "html.parser").get_text()) * _CONTENT_JS_RATIO
+    )
 
     winner_result = await evaluator.evaluate(
         candidates  = candidates,

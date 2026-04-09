@@ -1,15 +1,27 @@
 """
-core/scraper.py — v19: Slim orchestrator.
+core/scraper.py — v20: Slim orchestrator.
 
-Fix P0-2: requires_playwright persist đúng cách qua pm.save_profile().
-Fix P0-3: asyncio.sleep nằm BÊN TRONG try/except CancelledError.
-Fix P2-13: all_visited và fingerprints được giữ là set trong memory,
-  chỉ serialize thành list khi save_progress(). Tránh O(n) set/list
-  conversion mỗi chapter.
-Fix P2-15: xóa dead import context_summary.
-Fix P3-18: os.makedirs chỉ được gọi SAU KHI actual_output_dir được xác định
-  (sau naming phase), không trước — tránh tạo thư mục rác URL-based.
-Fix P3-19: document rõ thread behavior trong _run_protected khi timeout.
+P1-A: HTTP 429 với empty HTML không còn terminate story.
+  Trước: is_junk_page() đã xóa 429 khỏi _JUNK_STATUSES (đúng), nhưng nếu
+         response trả về HTML rỗng kèm status 429, điều kiện `not html` = True
+         → return None → story dừng vĩnh viễn.
+  Sau:  Check status 429 riêng biệt TRƯỚC khi check `is_junk_page`.
+        Raise RuntimeError("HTTP 429") để caller's consecutive_errors guard
+        xử lý — backoff rồi retry, không dừng ngay.
+
+P1-E: Exception trong scrape_one_chapter được wrap với URL context.
+  Trước: exception re-raise không có URL → traceback trong run_novel_task
+         không biết chapter nào bị lỗi.
+  Sau:  Wrap thành RuntimeError(f"[{url}] {type}: {msg}") trước khi raise,
+        giữ nguyên __cause__ để không mất original traceback.
+
+P2-D: run_novel_task() tách thành 3 private helpers.
+  Trước: ~150 lines, 6 responsibilities trong 1 function.
+  Sau:
+    _ensure_profile()    — migration + learning phase
+    _setup_story()       — naming + story_id + output_dir
+    _run_scrape_loop()   — main scrape loop
+    run_novel_task()     — orchestrator gọi 3 helpers theo thứ tự
 """
 from __future__ import annotations
 
@@ -46,7 +58,6 @@ from ai.client            import AIRateLimiter
 from ai.agents            import ai_classify_and_find, ai_find_first_chapter
 
 from pipeline.executor    import run_chapter as pipeline_run_chapter
-# Fix P2-15: context_summary không có call site nào → import đã bị xóa
 
 logger = logging.getLogger(__name__)
 
@@ -66,28 +77,14 @@ async def _run_protected(coro, timeout: float, label: str = "") -> None:
     Chạy coroutine trong Task riêng biệt với timeout.
 
     Fix L4: thay asyncio.shield() trong finally block.
-
-    Fix P3-19: document thread behavior khi timeout.
-    Khi timeout xảy ra, task bị ABANDON (không cancel) — task vẫn tiếp tục
-    chạy trong background. Nếu task đó đang chạy asyncio.to_thread() (VD:
-    AdsFilter.post_process_directory), thread vẫn tiếp tục đến khi hoàn thành
-    hoặc process exit. Thread không có cơ chế interrupt từ Python asyncio.
-
-    Hành vi được chấp nhận vì:
-      1. post_process_directory ghi file atomic (ghi temp → rename) →
-         không corrupt nếu bị kill giữa chừng
-      2. Timeout chỉ xảy ra trong shutdown path → process sắp exit anyway
-      3. Alternative (threading.Event) sẽ phức tạp hóa AdsFilter không cần thiết
-
-    Nếu muốn graceful stop: implement cancellation token trong AdsFilter.
+    Fix P3-19: khi timeout, task bị abandon (không cancel) — documented.
     """
     task = asyncio.create_task(coro)
     try:
         await asyncio.wait_for(asyncio.shield(task), timeout=timeout)
     except asyncio.TimeoutError:
         logger.warning(
-            "[Scraper] %s timeout sau %.1fs — task tiếp tục trong background "
-            "(thread nếu có sẽ chạy đến khi hoàn thành hoặc process exit)",
+            "[Scraper] %s timeout sau %.1fs — task tiếp tục trong background",
             label or "cleanup", timeout,
         )
     except asyncio.CancelledError:
@@ -168,16 +165,15 @@ async def scrape_one_chapter(
     ai_limiter      : AIRateLimiter,
     ads_filter      : AdsFilter,
     issue_reporter  : IssueReporter,
-    all_visited     : set,          # Fix P2-13: nhận set trực tiếp từ caller
-    fingerprints    : set,          # Fix P2-13: nhận set trực tiếp từ caller
+    all_visited     : set,
+    fingerprints    : set,
     prefetched_html : str | None = None,
 ) -> str | None:
     """
     Scrape một chapter. Trả về next_url hoặc None khi dừng.
 
-    Fix P2-13: all_visited và fingerprints là set được pass từ run_novel_task.
-    Không còn set(list) → list(set) O(n) mỗi call — caller giữ set trong
-    memory suốt vòng đời story, chỉ serialize khi save_progress().
+    P1-A: HTTP 429 với empty HTML raise RuntimeError thay vì return None.
+    P1-E: Exceptions được wrap với URL context trước khi re-raise.
     """
     tag = _dtag(url)
 
@@ -204,14 +200,23 @@ async def scrape_one_chapter(
         ch_num  = progress.get("chapter_count", 0) + 1
         if any(kw in err_msg.lower() for kw in ("403", "captcha", "cloudflare", "blocked")):
             issue_reporter.report("BLOCKED", url, detail=err_msg[:120], chapter_num=ch_num)
-        raise
+        # P1-E: wrap với URL context để caller biết chapter nào lỗi
+        raise RuntimeError(f"[{url}] {type(e).__name__}: {err_msg}") from e
 
     html    = ctx.html
     content = ctx.content
+
+    # P1-A: check 429 TRƯỚC is_junk_page — 429 thường trả về body rỗng,
+    # điều kiện `not html` sẽ trigger return None → story dừng vĩnh viễn.
+    # Raise RuntimeError thay vì return None để consecutive_errors guard
+    # trong run_novel_task xử lý: backoff rồi retry.
+    if ctx.status_code == 429:
+        raise RuntimeError(f"HTTP 429 rate limited: {url}")
+
     title   = ctx.title_clean or "Unknown Title"
 
     if not html or is_junk_page(html, ctx.status_code):
-        if ctx.status_code in (403, 429):
+        if ctx.status_code == 403:
             ch_num = progress.get("chapter_count", 0) + 1
             issue_reporter.report("BLOCKED", url, detail=f"HTTP {ctx.status_code}", chapter_num=ch_num)
         print(f"  [{tag}] 🏁 Hết truyện / junk page", flush=True)
@@ -253,7 +258,7 @@ async def scrape_one_chapter(
     if fp in fingerprints:
         print(f"  [{tag}] ♻  Loop nội dung — dừng", flush=True)
         return None
-    fingerprints.add(fp)  # Fix P2-13: mutate set trực tiếp
+    fingerprints.add(fp)
 
     if not progress.get("story_title") and not progress.get("story_name_clean"):
         if progress.get("chapter_count", 0) == 0 and ctx.soup:
@@ -274,8 +279,7 @@ async def scrape_one_chapter(
     progress["chapter_count"]    = chapter_num
     progress["last_title"]       = title
     progress["last_scraped_url"] = url
-    all_visited.add(url)  # Fix P2-13: mutate set trực tiếp
-    # Serialize cho progress file chỉ khi cần save
+    all_visited.add(url)
     progress["all_visited_urls"] = list(all_visited)
     progress["fingerprints"]     = list(fingerprints)
 
@@ -314,7 +318,6 @@ async def scrape_one_chapter(
         print(f"  [{tag}] ♻  next_url đã thăm — dừng", flush=True)
         return None
 
-    # Signal js_heavy cho caller qua transient progress key (Fix P0-2)
     if ctx.detected_js_heavy:
         progress["_js_heavy_detected"] = True  # type: ignore[typeddict-unknown-key]
 
@@ -415,27 +418,38 @@ async def _finalize_ads(
     print(f"  [Ads] 💾 {ads_filter.stats}", flush=True)
 
 
-# ── run_novel_task ────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# P2-D: run_novel_task() tách thành 3 private helpers
+# ══════════════════════════════════════════════════════════════════════════════
 
-async def run_novel_task(
-    start_url     : str,
-    output_dir    : str,
+async def _ensure_profile(
+    start_url  : str,
+    domain     : str,
+    tag        : str,
+    pool       : DomainSessionPool,
+    pw_pool    : PlaywrightPool,
+    pm         : ProfileManager,
+    ai_limiter : AIRateLimiter,
+    ads_filter : AdsFilter,
+    issue_reporter: IssueReporter,
     progress_path : str,
-    pool          : DomainSessionPool,
-    pw_pool       : PlaywrightPool,
-    pm            : ProfileManager,
-    ai_limiter    : AIRateLimiter,
-    on_chapter_done = None,
-) -> None:
-    domain = urlparse(start_url).netloc.lower()
-    tag    = _dtag(domain)
+) -> tuple[SiteProfile, list[str], list[tuple[str, str]]] | None:
+    """
+    Đảm bảo domain có profile hợp lệ (v2).
 
-    actual_output_dir  = output_dir
-    ads_filter         = AdsFilter.load(domain=domain)
-    issue_reporter     = IssueReporter(domain=domain)
-    pre_fetched_titles : list[str] = []
-    fetched_chapters   : list[tuple[str, str]] = []
+    Returns:
+        (profile, pre_fetched_titles, fetched_chapters)
+        None nếu learning phase thất bại (caller nên abort).
 
+    Responsibilities:
+        1. Migrate v1 → v2 nếu cần
+        2. Chạy learning phase nếu chưa có hoặc profile cũ
+        3. Inject ads từ profile vào ads_filter
+    """
+    pre_fetched_titles: list[str] = []
+    fetched_chapters  : list[tuple[str, str]] = []
+
+    # Migrate nếu cần
     if pm.has(domain):
         existing = pm.get(domain)
         from learning.migrator import needs_migration, migrate_profile
@@ -448,6 +462,7 @@ async def run_novel_task(
                 del migrated["pipeline"]  # type: ignore[misc]
                 await pm.save_profile(domain, migrated)  # type: ignore[arg-type]
 
+    # Learning phase nếu chưa có hoặc profile cũ
     if not pm.has(domain) or not pm.is_profile_fresh(domain):
         if os.path.exists(progress_path):
             try:
@@ -462,7 +477,7 @@ async def run_novel_task(
             print(f"  [{tag}] ❌ Learning Phase thất bại. Bỏ qua.", flush=True)
             issue_reporter.report("LEARNING_FAILED", start_url, detail="run_learning_phase() returned None")
             issue_reporter.summarize(0)
-            return
+            return None
 
         profile, pre_fetched_titles, fetched_chapters = result
         injected = ads_filter.inject_from_profile(profile)
@@ -482,20 +497,44 @@ async def run_novel_task(
         })
     else:
         print(f"  [{tag}] 📂 {pm.summary(domain)}", flush=True)
-        profile            = pm.get(domain)
-        pre_fetched_titles = []
-        fetched_chapters   = []
-        injected           = ads_filter.inject_from_profile(profile)
+        profile  = pm.get(domain)
+        injected = ads_filter.inject_from_profile(profile)
         if injected > 0:
             print(f"  [{tag}] [Ads] +{injected} từ profile | {ads_filter.stats}", flush=True)
 
-    try:
-        current_url, progress = await find_start_chapter(
-            start_url, progress_path, pool, pw_pool, ai_limiter, profile,
-        )
-    except Exception as e:
-        print(f"  [{tag}] ❌ Không tìm được điểm bắt đầu: {e}", flush=True)
-        return
+    return profile, pre_fetched_titles, fetched_chapters
+
+
+async def _setup_story(
+    start_url     : str,
+    domain        : str,
+    tag           : str,
+    output_dir    : str,
+    progress_path : str,
+    profile       : SiteProfile,
+    pool          : DomainSessionPool,
+    pw_pool       : PlaywrightPool,
+    pm            : ProfileManager,
+    ai_limiter    : AIRateLimiter,
+    pre_fetched_titles: list[str],
+) -> tuple[str, ProgressDict, str]:
+    """
+    Setup story: naming + story_id + output_dir.
+
+    Returns:
+        (current_url, progress, actual_output_dir)
+
+    Responsibilities:
+        1. find_start_chapter()
+        2. Naming phase nếu chưa chạy
+        3. Story ID lock
+        4. Xác định actual_output_dir và makedirs
+
+    Fix P3-18: makedirs chỉ được gọi SAU KHI actual_output_dir đã biết chắc.
+    """
+    current_url, progress = await find_start_chapter(
+        start_url, progress_path, pool, pw_pool, ai_limiter, profile,
+    )
 
     if not progress.get("naming_done"):
         from learning.naming import run_naming_phase
@@ -520,31 +559,39 @@ async def run_novel_task(
             progress["story_id_locked"] = True
             await save_progress(progress_path, progress)
 
-    # Fix P3-18: actual_output_dir xác định TRƯỚC makedirs.
-    # Trước: makedirs(output_dir) được gọi trước naming phase → tạo thư mục
-    # rác URL-based (VD: "royalroad_com_fiction_55418") ngay cả khi naming
-    # phase sẽ override sang story-name dir. Sau naming phase, output_dir_final
-    # được set và makedirs lại → 2 thư mục trên disk, 1 cái rác.
-    # Sau: chỉ gọi makedirs 1 lần, sau khi actual_output_dir đã biết chắc.
+    # Fix P3-18: makedirs chỉ sau khi actual_output_dir xác định
     actual_output_dir = progress.get("output_dir_final") or output_dir
     os.makedirs(actual_output_dir, exist_ok=True)
 
-    story_label = (
-        progress.get("story_name_clean")
-        or progress.get("story_title")
-        or urlparse(start_url).netloc
-    )
-    issue_reporter.set_story_label(story_label)
+    return current_url, progress, actual_output_dir
 
-    print(f"\n{'─'*62}", flush=True)
-    print(f"  🚀 [{tag}] {story_label}", flush=True)
-    print(f"{'─'*62}", flush=True)
 
-    prefetch_map: dict[str, str] = {url: html for url, html in fetched_chapters}
+async def _run_scrape_loop(
+    start_url      : str,
+    domain         : str,
+    tag            : str,
+    current_url    : str,
+    progress       : ProgressDict,
+    progress_path  : str,
+    actual_output_dir: str,
+    pool           : DomainSessionPool,
+    pw_pool        : PlaywrightPool,
+    profile        : SiteProfile,
+    pm             : ProfileManager,
+    ai_limiter     : AIRateLimiter,
+    ads_filter     : AdsFilter,
+    issue_reporter : IssueReporter,
+    prefetch_map   : dict[str, str],
+    on_chapter_done,
+) -> bool:
+    """
+    Main scrape loop. Returns True nếu bị cancelled.
 
-    # Fix P2-13: giữ set trong memory suốt vòng đời story.
-    # Không còn set(list) → list(set) O(n) mỗi chapter.
-    # Serialize → list chỉ khi save_progress() (trong scrape_one_chapter).
+    Responsibilities:
+        1. Chapter-by-chapter scraping với retry logic
+        2. js_heavy persistence
+        3. Consecutive error/timeout/empty guards
+    """
     all_visited  : set[str] = set(progress.get("all_visited_urls") or [])
     fingerprints : set[str] = set(progress.get("fingerprints") or [])
 
@@ -559,8 +606,6 @@ async def run_novel_task(
                 break
 
             try:
-                # Fix P0-3: asyncio.sleep BÊN TRONG try/except CancelledError
-                # → _cancelled luôn được set đúng kể cả cancel trong sleep
                 await asyncio.sleep(get_delay(current_url))
 
                 prev_count = progress.get("chapter_count", 0)
@@ -577,14 +622,14 @@ async def run_novel_task(
                     ai_limiter      = ai_limiter,
                     ads_filter      = ads_filter,
                     issue_reporter  = issue_reporter,
-                    all_visited     = all_visited,    # Fix P2-13
-                    fingerprints    = fingerprints,   # Fix P2-13
+                    all_visited     = all_visited,
+                    fingerprints    = fingerprints,
                     prefetched_html = prefetched,
                 )
                 consecutive_errors   = 0
                 consecutive_timeouts = 0
 
-                # Fix P0-2: persist requires_playwright nếu js_heavy được detect
+                # Persist js_heavy nếu được detect
                 if progress.pop("_js_heavy_detected", False) and not profile.get("requires_playwright"):
                     profile["requires_playwright"] = True  # type: ignore[typeddict-unknown-key]
                     updated_profile = {**pm.get(domain), "requires_playwright": True}
@@ -627,8 +672,9 @@ async def run_novel_task(
             except Exception as e:
                 consecutive_errors += 1
                 import traceback
+                # P1-E: URL đã được embed vào exception message bởi scrape_one_chapter
                 print(
-                    f"  [{tag}] ⚠  ERR #{consecutive_errors}: {type(e).__name__}: {e}\n"
+                    f"  [{tag}] ⚠  ERR #{consecutive_errors}: {e}\n"
                     f"{traceback.format_exc()}",
                     flush=True,
                 )
@@ -636,9 +682,112 @@ async def run_novel_task(
                     break
 
     finally:
+        pass   # caller handles cleanup
+
+    return _cancelled
+
+
+# ── run_novel_task ────────────────────────────────────────────────────────────
+
+async def run_novel_task(
+    start_url     : str,
+    output_dir    : str,
+    progress_path : str,
+    pool          : DomainSessionPool,
+    pw_pool       : PlaywrightPool,
+    pm            : ProfileManager,
+    ai_limiter    : AIRateLimiter,
+    on_chapter_done = None,
+) -> None:
+    """
+    Top-level orchestrator. Gọi 3 helpers theo thứ tự:
+        1. _ensure_profile()  — migration + learning
+        2. _setup_story()     — naming + story_id + output_dir
+        3. _run_scrape_loop() — main loop
+    """
+    domain = urlparse(start_url).netloc.lower()
+    tag    = _dtag(domain)
+
+    ads_filter     = AdsFilter.load(domain=domain)
+    issue_reporter = IssueReporter(domain=domain)
+
+    # ── 1. Ensure profile ──────────────────────────────────────────────────
+    ensure_result = await _ensure_profile(
+        start_url      = start_url,
+        domain         = domain,
+        tag            = tag,
+        pool           = pool,
+        pw_pool        = pw_pool,
+        pm             = pm,
+        ai_limiter     = ai_limiter,
+        ads_filter     = ads_filter,
+        issue_reporter = issue_reporter,
+        progress_path  = progress_path,
+    )
+    if ensure_result is None:
+        return   # learning phase failed, already reported
+
+    profile, pre_fetched_titles, fetched_chapters = ensure_result
+
+    # ── 2. Setup story ─────────────────────────────────────────────────────
+    try:
+        current_url, progress, actual_output_dir = await _setup_story(
+            start_url          = start_url,
+            domain             = domain,
+            tag                = tag,
+            output_dir         = output_dir,
+            progress_path      = progress_path,
+            profile            = profile,
+            pool               = pool,
+            pw_pool            = pw_pool,
+            pm                 = pm,
+            ai_limiter         = ai_limiter,
+            pre_fetched_titles = pre_fetched_titles,
+        )
+    except Exception as e:
+        print(f"  [{tag}] ❌ Setup thất bại: {e}", flush=True)
+        return
+
+    story_label = (
+        progress.get("story_name_clean")
+        or progress.get("story_title")
+        or urlparse(start_url).netloc
+    )
+    issue_reporter.set_story_label(story_label)
+
+    print(f"\n{'─'*62}", flush=True)
+    print(f"  🚀 [{tag}] {story_label}", flush=True)
+    print(f"{'─'*62}", flush=True)
+
+    prefetch_map: dict[str, str] = {url: html for url, html in fetched_chapters}
+
+    # ── 3. Scrape loop ─────────────────────────────────────────────────────
+    _cancelled = False
+    try:
+        _cancelled = await _run_scrape_loop(
+            start_url         = start_url,
+            domain            = domain,
+            tag               = tag,
+            current_url       = current_url,
+            progress          = progress,
+            progress_path     = progress_path,
+            actual_output_dir = actual_output_dir,
+            pool              = pool,
+            pw_pool           = pw_pool,
+            profile           = profile,
+            pm                = pm,
+            ai_limiter        = ai_limiter,
+            ads_filter        = ads_filter,
+            issue_reporter    = issue_reporter,
+            prefetch_map      = prefetch_map,
+            on_chapter_done   = on_chapter_done,
+        )
+    except asyncio.CancelledError:
+        _cancelled = True
+        raise
+    finally:
         total     = progress.get("chapter_count", 0)
         completed = progress.get("completed", False)
-        label     = progress.get("story_name_clean") or progress.get("story_title") or start_url[:50]
 
         issue_reporter.summarize(total)
 
@@ -658,4 +807,4 @@ async def run_novel_task(
         await _run_protected(pm.flush(), timeout=_FLUSH_TIMEOUT_SEC, label="pm.flush")
 
         icon = "✔" if completed else ("🛑" if _cancelled else "⏸")
-        print(f"\n  {icon} [{tag}] {label} — {total} chapters\n", flush=True)
+        print(f"\n  {icon} [{tag}] {story_label} — {total} chapters\n", flush=True)

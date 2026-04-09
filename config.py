@@ -3,6 +3,9 @@ config.py — Hằng số, regex và helpers thuần túy.
 Không import từ module nội bộ nào.
 
 v2: Thêm PW_MAX_CONCURRENCY, EMPTY_BACKOFF_SCHEDULE cho pipeline architecture.
+v3: P1-B — thêm JS_CONTENT_RATIO, JS_MIN_DIFF_CHARS để tránh DRY violation.
+    Ba nơi dùng cùng threshold: fetcher.py, optimizer.py, phase.py.
+    Đặt ở đây để thay đổi threshold chỉ cần sửa 1 file.
 """
 import os
 import re
@@ -49,22 +52,30 @@ AI_JITTER  = (0.5, 2.0)
 # ── HTTP ──────────────────────────────────────────────────────────────────────
 REQUEST_TIMEOUT = 60
 
-# ── Playwright concurrency (NEW) ─────────────────────────────────────────────
-# Số Playwright instances chạy đồng thời tối đa.
-# Tăng nếu có nhiều RAM, giảm nếu máy yếu.
-# Override bằng CLI: --max-pw-instances N
+# ── Playwright concurrency ────────────────────────────────────────────────────
 PW_MAX_CONCURRENCY: int = int(os.getenv("PW_MAX_CONCURRENCY", "2"))
 
-# ── Empty streak backoff schedule (NEW) ──────────────────────────────────────
-# Khi gặp N chapter liên tiếp không có nội dung → backoff theo schedule này (seconds).
-# [60, 120, 300] = chờ 1 phút → 2 phút → 5 phút trước khi dừng hẳn.
+# ── JS-heavy detection thresholds (P1-B) ─────────────────────────────────────
+# Playwright/curl content ratio threshold để classify site là JS-heavy.
+# Nếu pw_text_len > curl_text_len * JS_CONTENT_RATIO AND diff > JS_MIN_DIFF_CHARS
+# → site cần Playwright để render content đầy đủ.
+#
+# Dùng bởi: pipeline/fetcher.py (HybridFetchBlock._detect_js_fetch)
+#            learning/optimizer.py (PipelineGenerator.generate + run_optimizer)
+#
+# Tăng ratio nếu muốn ít false positives hơn (chỉ flag site thật sự JS-heavy).
+# Giảm nếu muốn aggressive hơn (flag cả site load content nhỏ qua JS).
+JS_CONTENT_RATIO  : float = 1.5
+JS_MIN_DIFF_CHARS : int   = 500
+
+# ── Empty streak backoff schedule ─────────────────────────────────────────────
 EMPTY_BACKOFF_SCHEDULE: list[int] = [60, 120, 300]
 
 # ── Misc ──────────────────────────────────────────────────────────────────────
 INIT_STAGGER = 2.0  # seconds giữa các task khi khởi động
 
 # ── Chrome fingerprint rotation ───────────────────────────────────────────────
-CHROME_VERSIONS = ["chrome119", "chrome120", "chrome123", "chrome124", "chrome131"]
+CHROME_VERSIONS: list[str] = ["chrome119", "chrome120", "chrome123", "chrome124", "chrome131"]
 CHROME_UA: dict[str, str] = {
     "chrome119": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
     "chrome120": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",

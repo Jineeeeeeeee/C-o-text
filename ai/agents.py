@@ -1,19 +1,26 @@
 """
-ai/agents.py — Tất cả hàm gọi Gemini API.
+ai/agents.py — patch P2-B + P2-C trên nền Batch 1.
 
-Fix P1-10: đổi tên _snippet() → snippet() — bỏ underscore prefix.
-  _snippet là internal convention nhưng được import cross-module bởi
-  phase_ai.py. Đặt underscore mà export ra ngoài là contradictory.
-  Giải pháp đúng: bỏ underscore, đây là public utility của AI layer.
-  Backward compat: alias _snippet = snippet để không break bất kỳ caller nào.
+P2-B: snippet() early-exit nếu raw html đã <= max_len.
+  Trước: mọi HTML đều qua BeautifulSoup parse + serialize (str(soup)) dù
+         HTML đã nhỏ hơn max_len. Parse + serialize không miễn phí —
+         200KB HTML mất ~15-30ms trên BS4.
+  Sau:  Nếu len(html) <= max_len → return html trực tiếp, bỏ qua parse.
+        Trade-off được chấp nhận: HTML raw có thể chứa script/style tags
+        nhưng với AI analysis, chúng ít quan trọng hơn latency tiết kiệm.
+        Với trang lớn (> max_len) vẫn strip script/style như cũ.
 
-Fix P2-14: snippet() không cắt giữa HTML tag.
-  Trước: str(soup)[:max_len] — kết thúc giữa tag đang mở.
-  VD: '<div class="chapter-con' → AI nhận fragment với unclosed tags.
-  Sau: nếu HTML sau strip script/style vẫn > max_len, fallback sang
-  soup.get_text()[:max_len] — plain text không có tag fragments.
-  Trade-off: mất HTML structure khi trang lớn, nhưng AI vẫn có đủ text
-  content để phân tích. Với trang nhỏ (< max_len), vẫn trả về full HTML.
+        Lưu ý: check len(html) chứ không phải len(cleaned) — cleaned có thể
+        nhỏ hơn html sau khi strip scripts, nhưng nếu html đã nhỏ thì
+        cleaned chắc chắn cũng nhỏ → parse luôn cho output đầy đủ.
+
+P2-C: _parse() thay greedy regex bằng json.JSONDecoder.raw_decode().
+  Trước: re.search(r"(\\{[\\s\\S]*\\}|\\[[\\s\\S]*\\])", text) trên response
+         rất dài → catastrophic backtracking với nested structures.
+  Sau:  Dùng json.JSONDecoder.raw_decode() để tìm JSON object/array đầu tiên
+        từ mỗi vị trí '{' và '['. Không dùng regex → không có ReDoS risk.
+        Chậm hơn một chút khi text không có JSON (phải thử nhiều vị trí),
+        nhưng đây là exceptional path — normal path là text đã là JSON thuần.
 """
 from __future__ import annotations
 
@@ -37,11 +44,15 @@ _RETRY_BACKOFF = [30, 60]
 
 
 def _is_retriable(e: Exception) -> bool:
+    """P1-D: retry cho rate limit + network errors."""
     code = getattr(e, "status_code", None) or getattr(e, "code", None)
     if code in (429, 503):
         return True
     msg = (str(e) or repr(e)).lower()
-    return any(kw in msg for kw in ("429", "503", "quota", "resource_exhausted", "unavailable"))
+    return any(kw in msg for kw in (
+        "429", "503", "quota", "resource_exhausted", "unavailable",
+        "connection", "timeout", "network", "reset", "refused", "broken pipe",
+    ))
 
 
 def _fmt(e: Exception) -> str:
@@ -85,7 +96,7 @@ async def _call(
                     return None
             if _is_retriable(e) and not is_last:
                 wait = _RETRY_BACKOFF[min(attempt, len(_RETRY_BACKOFF) - 1)]
-                print(f"  [AI] ⚠ Rate limit/503 (lần {attempt+1}), thử lại sau {wait}s", flush=True)
+                print(f"  [AI] ⚠ Retriable error (lần {attempt+1}), thử lại sau {wait}s: {_fmt(e)[:80]}", flush=True)
                 await asyncio.sleep(wait)
             else:
                 raise
@@ -93,18 +104,52 @@ async def _call(
 
 
 def _parse(text: str | None) -> dict | list | None:
+    """
+    Parse JSON từ AI response text.
+
+    P2-C: thay greedy regex bằng json.JSONDecoder.raw_decode().
+
+    Strategy:
+        1. Strip markdown fences (```json ... ```)
+        2. Thử parse toàn bộ string trực tiếp (fast path — AI response thường sạch)
+        3. Nếu fail: tìm JSON object/array đầu tiên bằng raw_decode() tại
+           mỗi vị trí '{' và '[' (no regex, no ReDoS)
+        4. Trả về None nếu không tìm được JSON hợp lệ
+
+    raw_decode(s, idx) parse JSON bắt đầu từ vị trí idx, trả về (obj, end_idx).
+    Không cần match đến hết string — perfect cho "extract first JSON from text".
+    """
     if not text:
         return None
+
     text = text.strip()
+    # Strip markdown fences
     text = re.sub(r"^```(?:json)?\s*", "", text)
     text = re.sub(r"\s*```$", "", text)
-    m = re.search(r"(\{[\s\S]*\}|\[[\s\S]*\])", text)
-    if m:
-        text = m.group(1)
+    text = text.strip()
+
+    # Fast path: text đã là JSON thuần (đa số trường hợp với structured output)
     try:
         return json.loads(text)
     except json.JSONDecodeError:
-        return None
+        pass
+
+    # Slow path: tìm JSON object hoặc array đầu tiên trong text
+    # Dùng raw_decode thay vì regex — không có ReDoS risk
+    decoder = json.JSONDecoder()
+    for start_char, search_start in (("{", 0), ("[", 0)):
+        pos = 0
+        while True:
+            idx = text.find(start_char, pos)
+            if idx == -1:
+                break
+            try:
+                obj, _ = decoder.raw_decode(text, idx)
+                return obj
+            except json.JSONDecodeError:
+                pos = idx + 1
+
+    return None
 
 
 # ── HTML helpers ──────────────────────────────────────────────────────────────
@@ -116,18 +161,20 @@ def snippet(html: str, max_len: int = 10000) -> str:
     Fix P1-10: đổi tên từ _snippet → snippet (public function).
     Fix P2-14: không cắt giữa tag đang mở.
 
-    Logic:
-        1. Strip script/style tags (không cần cho AI analysis)
-        2. Nếu cleaned HTML <= max_len → trả về toàn bộ (có HTML structure)
-        3. Nếu > max_len → fallback sang get_text()[:max_len]
-           (mất HTML structure nhưng không bao giờ tạo fragment unclosed tag)
+    P2-B: early-exit nếu html đã nhỏ hơn max_len — tránh parse không cần thiết.
 
-    Trade-off được chấp nhận:
-        - Trang nhỏ: AI nhận full HTML với tags → phân tích selectors tốt nhất
-        - Trang lớn: AI nhận plain text → có thể analyze content nhưng
-          không thể suggest CSS selectors chính xác từ đây.
-          Trong thực tế max_len=10000 đủ cho phần lớn trang web novel.
+    Logic:
+        1. [P2-B] Nếu len(html) <= max_len → return html trực tiếp.
+           HTML raw có thể có script/style nhưng phần lớn trang web novel
+           nhỏ hơn 10000 chars → parse luôn cũng trả về đầy đủ → bỏ qua parse.
+        2. Strip script/style, nếu cleaned <= max_len → return cleaned HTML.
+        3. Nếu vẫn > max_len → fallback sang get_text()[:max_len].
     """
+    # P2-B: fast path — html đã đủ nhỏ, không cần parse
+    if len(html) <= max_len:
+        return html
+
+    # HTML lớn hơn max_len — strip scripts rồi check lại
     soup = BeautifulSoup(html, "html.parser")
     for t in soup.find_all(["script", "style", "noscript"]):
         t.decompose()
@@ -136,11 +183,11 @@ def snippet(html: str, max_len: int = 10000) -> str:
     if len(cleaned) <= max_len:
         return cleaned
 
-    # Fallback: plain text — không bao giờ cắt giữa tag
+    # Vẫn quá lớn — fallback sang plain text (không cắt giữa tag)
     return soup.get_text(separator="\n", strip=True)[:max_len]
 
 
-# Backward compat alias — giữ cho bất kỳ code nào vẫn dùng _snippet
+# Backward compat alias
 _snippet = snippet
 
 
@@ -493,10 +540,15 @@ _S_EXTRACT_CONTENT = {
 
 # ══════════════════════════════════════════════════════════════════════════════
 # LEARNING PHASE AGENTS
+# P0-A: KHÔNG gọi snippet() — caller (phase_ai.py) đã cắt HTML trước.
 # ══════════════════════════════════════════════════════════════════════════════
 
-async def ai_dom_structure(html1, url1, html2, url2, limiter):
-    prompt = Prompts.learning_1_dom_structure(snippet(html1, 10000), url1, snippet(html2, 8000), url2)
+async def ai_dom_structure(
+    html1: str, url1: str,
+    html2: str, url2: str,
+    limiter: AIRateLimiter,
+) -> dict | None:
+    prompt = Prompts.learning_1_dom_structure(html1, url1, html2, url2)
     try:
         text   = await _call(prompt, limiter, _S_DOM_STRUCTURE)
         result = _parse(text)
@@ -513,8 +565,12 @@ async def ai_dom_structure(html1, url1, html2, url2, limiter):
     return None
 
 
-async def ai_independent_check(html1, url1, html2, url2, limiter):
-    prompt = Prompts.learning_2_independent_check(snippet(html1, 10000), url1, snippet(html2, 8000), url2)
+async def ai_independent_check(
+    html1: str, url1: str,
+    html2: str, url2: str,
+    limiter: AIRateLimiter,
+) -> dict | None:
+    prompt = Prompts.learning_2_independent_check(html1, url1, html2, url2)
     try:
         text   = await _call(prompt, limiter, _S_INDEPENDENT_CHECK)
         result = _parse(text)
@@ -534,8 +590,13 @@ async def ai_independent_check(html1, url1, html2, url2, limiter):
     return None
 
 
-async def ai_stability_check(html3, url3, html4, url4, consensus, limiter):
-    prompt = Prompts.learning_3_stability_check(snippet(html3, 8000), url3, snippet(html4, 8000), url4, consensus)
+async def ai_stability_check(
+    html3: str, url3: str,
+    html4: str, url4: str,
+    consensus: dict,
+    limiter: AIRateLimiter,
+) -> dict | None:
+    prompt = Prompts.learning_3_stability_check(html3, url3, html4, url4, consensus)
     try:
         text   = await _call(prompt, limiter, _S_STABILITY)
         result = _parse(text)
@@ -555,8 +616,14 @@ async def ai_stability_check(html3, url3, html4, url4, consensus, limiter):
     return None
 
 
-async def ai_remove_audit(html5, url5, remove_selectors, content_selector, title_selector, limiter):
-    prompt = Prompts.learning_4_remove_audit(snippet(html5, 8000), url5, remove_selectors, content_selector, title_selector)
+async def ai_remove_audit(
+    html5: str, url5: str,
+    remove_selectors: list[str],
+    content_selector: str | None,
+    title_selector: str | None,
+    limiter: AIRateLimiter,
+) -> dict | None:
+    prompt = Prompts.learning_4_remove_audit(html5, url5, remove_selectors, content_selector, title_selector)
     try:
         text   = await _call(prompt, limiter, _S_REMOVE_AUDIT)
         result = _parse(text)
@@ -572,8 +639,13 @@ async def ai_remove_audit(html5, url5, remove_selectors, content_selector, title
     return None
 
 
-async def ai_title_deepdive(html6, url6, title_selector, author_selector, limiter):
-    prompt = Prompts.learning_5_title_deepdive(snippet(html6, 8000), url6, title_selector, author_selector)
+async def ai_title_deepdive(
+    html6: str, url6: str,
+    title_selector: str | None,
+    author_selector: str | None,
+    limiter: AIRateLimiter,
+) -> dict | None:
+    prompt = Prompts.learning_5_title_deepdive(html6, url6, title_selector, author_selector)
     try:
         text   = await _call(prompt, limiter, _S_TITLE_DEEPDIVE)
         result = _parse(text)
@@ -588,8 +660,11 @@ async def ai_title_deepdive(html6, url6, title_selector, author_selector, limite
     return None
 
 
-async def ai_special_content(html7, url7, limiter):
-    prompt = Prompts.learning_6_special_content(snippet(html7, 8000), url7)
+async def ai_special_content(
+    html7: str, url7: str,
+    limiter: AIRateLimiter,
+) -> dict | None:
+    prompt = Prompts.learning_6_special_content(html7, url7)
     try:
         text   = await _call(prompt, limiter, _S_SPECIAL_CONTENT)
         result = _parse(text)
@@ -616,8 +691,11 @@ async def ai_special_content(html7, url7, limiter):
     return None
 
 
-async def ai_ads_deepscan(html8, url8, limiter):
-    prompt = Prompts.learning_7_ads_deepscan(snippet(html8, 8000), url8)
+async def ai_ads_deepscan(
+    html8: str, url8: str,
+    limiter: AIRateLimiter,
+) -> dict | None:
+    prompt = Prompts.learning_7_ads_deepscan(html8, url8)
     try:
         text   = await _call(prompt, limiter, _S_ADS_DEEPSCAN)
         result = _parse(text)
@@ -636,8 +714,13 @@ async def ai_ads_deepscan(html8, url8, limiter):
     return None
 
 
-async def ai_nav_stress(html9, url9, next_selector, nav_type, limiter):
-    prompt = Prompts.learning_8_nav_stress(snippet(html9, 8000), url9, next_selector, nav_type)
+async def ai_nav_stress(
+    html9: str, url9: str,
+    next_selector: str | None,
+    nav_type: str | None,
+    limiter: AIRateLimiter,
+) -> dict | None:
+    prompt = Prompts.learning_8_nav_stress(html9, url9, next_selector, nav_type)
     try:
         text   = await _call(prompt, limiter, _S_NAV_STRESS)
         result = _parse(text)
@@ -653,8 +736,12 @@ async def ai_nav_stress(html9, url9, next_selector, nav_type, limiter):
     return None
 
 
-async def ai_full_simulation(html10, url10, profile_so_far, limiter):
-    prompt = Prompts.learning_9_full_simulation(snippet(html10, 8000), url10, profile_so_far)
+async def ai_full_simulation(
+    html10: str, url10: str,
+    profile_so_far: dict,
+    limiter: AIRateLimiter,
+) -> dict | None:
+    prompt = Prompts.learning_9_full_simulation(html10, url10, profile_so_far)
     try:
         text   = await _call(prompt, limiter, _S_SIMULATION)
         result = _parse(text)
@@ -674,7 +761,15 @@ async def ai_full_simulation(html10, url10, profile_so_far, limiter):
     return None
 
 
-async def ai_master_synthesis(synthesis_summary, domain, limiter):
+# ══════════════════════════════════════════════════════════════════════════════
+# UTILITY AGENTS — tự gọi snippet() vì caller không cắt trước
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def ai_master_synthesis(
+    synthesis_summary: str,
+    domain: str,
+    limiter: AIRateLimiter,
+) -> dict | None:
     prompt = Prompts.learning_10_master_synthesis(synthesis_summary, domain)
     try:
         text   = await _call(prompt, limiter, _S_MASTER)
@@ -704,11 +799,11 @@ async def ai_master_synthesis(synthesis_summary, domain, limiter):
     return None
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# UTILITY AGENTS
-# ══════════════════════════════════════════════════════════════════════════════
-
-async def ai_extract_naming_rules(raw_titles, base_url, limiter):
+async def ai_extract_naming_rules(
+    raw_titles: list[str],
+    base_url: str,
+    limiter: AIRateLimiter,
+) -> dict | None:
     if not raw_titles:
         return None
     prompt = Prompts.naming_rules(raw_titles, base_url)
@@ -728,7 +823,11 @@ async def ai_extract_naming_rules(raw_titles, base_url, limiter):
     return None
 
 
-async def ai_find_first_chapter(html, base_url, limiter):
+async def ai_find_first_chapter(
+    html: str,
+    base_url: str,
+    limiter: AIRateLimiter,
+) -> str | None:
     links = await asyncio.to_thread(_chapter_links, html, base_url)
     if not links:
         return None
@@ -748,7 +847,11 @@ async def ai_find_first_chapter(html, base_url, limiter):
     return links[0]
 
 
-async def ai_classify_and_find(html, base_url, limiter):
+async def ai_classify_and_find(
+    html: str,
+    base_url: str,
+    limiter: AIRateLimiter,
+) -> dict | None:
     hints   = await asyncio.to_thread(_nav_hints, html, base_url)
     snip    = await asyncio.to_thread(snippet, html, 5000)
     prompt  = Prompts.classify_and_find(hints, snip, base_url)
@@ -764,7 +867,11 @@ async def ai_classify_and_find(html, base_url, limiter):
     return None
 
 
-async def ai_verify_ads(candidates, domain, limiter):
+async def ai_verify_ads(
+    candidates: list[str],
+    domain: str,
+    limiter: AIRateLimiter,
+) -> list[str]:
     if not candidates:
         return []
     prompt = Prompts.verify_ads(candidates, domain)
@@ -788,7 +895,11 @@ async def ai_verify_ads(candidates, domain, limiter):
     return []
 
 
-async def ai_extract_content(html, url, limiter):
+async def ai_extract_content(
+    html: str,
+    url: str,
+    limiter: AIRateLimiter,
+) -> str | None:
     _MIN_CHARS      = 150
     _MIN_CONFIDENCE = 0.3
     prompt = Prompts.extract_content(snippet(html, 8000), url)

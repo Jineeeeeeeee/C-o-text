@@ -11,9 +11,8 @@ v2 changes:
            Executor đọc signal này, set ctx.detected_js_heavy = True.
            Caller (scraper.py) quyết định có persist xuống profile không.
 
-           Lý do: Block không có đủ context để biết khi nào nên persist
-           (có thể đang trong learning phase, có thể đang scrape chapter 1,
-           có thể là false positive). Đó là trách nhiệm của orchestrator.
+  P1-B: _JS_CONTENT_RATIO và _JS_MIN_DIFF_CHARS được import từ config.py
+        thay vì hardcode tại đây. Một source of truth cho cả project.
 
 Blocks:
     CurlFetchBlock       — curl_cffi Chrome TLS fingerprint (nhanh, ít RAM)
@@ -26,13 +25,11 @@ from __future__ import annotations
 import asyncio
 import time
 
+from config import JS_CONTENT_RATIO as _JS_CONTENT_RATIO, JS_MIN_DIFF_CHARS as _JS_MIN_DIFF_CHARS
 from utils.string_helpers import is_cloudflare_challenge, is_junk_page
 from pipeline.base import (
     BlockType, BlockResult, PipelineContext, ScraperBlock,
 )
-
-_JS_CONTENT_RATIO  = 1.5    # Playwright > curl × ratio → js-heavy
-_JS_MIN_DIFF_CHARS = 500    # Tránh noise với content nhỏ
 
 
 class CurlFetchBlock(ScraperBlock):
@@ -159,11 +156,13 @@ class HybridFetchBlock(ScraperBlock):
     Learning mode (detect_js=True):
         1. Fetch bằng CẢ curl VÀ Playwright
         2. So sánh text content length
-        3. Nếu Playwright > curl × 1.5 AND diff > 500 chars:
+        3. Nếu Playwright > curl × JS_CONTENT_RATIO AND diff > JS_MIN_DIFF_CHARS:
            → Báo "js_heavy": True qua BlockResult.metadata
            → Executor set ctx.detected_js_heavy = True
            → Caller persist vào profile NẾU phù hợp
            KHÔNG tự mutate ctx.profile — đó không phải việc của block.
+
+    P1-B: threshold _JS_CONTENT_RATIO, _JS_MIN_DIFF_CHARS import từ config.py.
     """
     block_type = BlockType.FETCH
     name       = "hybrid"
@@ -299,6 +298,8 @@ class HybridFetchBlock(ScraperBlock):
 
         Signal "js_heavy" được trả về trong BlockResult.metadata.
         KHÔNG mutate ctx.profile — đó là việc của executor/caller.
+
+        P1-B: dùng _JS_CONTENT_RATIO, _JS_MIN_DIFF_CHARS từ config.py.
         """
         from bs4 import BeautifulSoup
 
@@ -358,13 +359,12 @@ class HybridFetchBlock(ScraperBlock):
         best_html   = pw_html   if pw_ok   else curl_html
         best_method = "playwright" if pw_ok else "curl"
 
-        # "js_heavy" là signal cho executor, KHÔNG phải side effect trên profile
         return BlockResult.success(
             data        = best_html,
             method_used = f"hybrid_detect_{best_method}",
             confidence  = 1.0,
             char_count  = len(best_html),
-            js_heavy    = is_js_heavy,    # ← signal, executor handles this
+            js_heavy    = is_js_heavy,
             curl_len    = curl_len,
             pw_len      = pw_len,
         )
