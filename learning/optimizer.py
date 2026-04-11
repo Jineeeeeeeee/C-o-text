@@ -1,14 +1,9 @@
-"""
-learning/optimizer.py — Pipeline optimization engine.
 
-Fix P2-12: PipelineEvaluator chạy candidates SONG SONG bằng asyncio.gather().
-Fix P2-16: _score_fetch_strategy() — fetch strategy được tính riêng.
-P1-B: _CONTENT_JS_RATIO và magic number 500 replaced bằng import từ config.py.
-"""
 from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -27,9 +22,107 @@ MAX_CANDIDATES       = 8
 MIN_CHAPTERS_TO_EVAL = 3
 
 # ── Keyword lists — module-level constants (P2-F) ─────────────────────────────
-# Tách ra module-level để tune không cần sửa trong function body.
 _CONTENT_KEYWORDS : tuple[str, ...] = ("chapter", "content", "text", "story", "read")
 _TITLE_KEYWORDS   : tuple[str, ...] = ("title", "chapter", "heading")
+
+
+# ── Fix OPTIMIZER-A: Edge noise detection ─────────────────────────────────────
+
+# Nav/support vocabulary — standalone short lines with these words → noise
+_EDGE_NOISE_SHORT_WORDS = frozenset({
+    "patreon", "donate", "subscribe", "support", "follow",
+    "previous", "prev", "next", "fiction", "toc", "contents",
+    "index", "home", "chapter", "report", "about", "achievements",
+    "join", "discord", "twitter", "kofi", "ko-fi",
+})
+
+# Regex patterns for noise lines regardless of word count
+_EDGE_NOISE_PATTERNS = (
+    re.compile(r"^end\s+(col|row)", re.I),           # "end col-md-8"
+    re.compile(r"^\*+\d+\*+$"),                       # "**5**" (author stat)
+    re.compile(r"^#{1,6}\s+support\b", re.I),         # "##### Support 'X'"
+    re.compile(r"^#{1,6}\s+about\s+the\s+author", re.I),
+    re.compile(r"^-\s*\*\*\s+\w{3}"),                 # "- ** Monday..." (date)
+)
+
+
+def _is_edge_noise_line(line: str) -> bool:
+    """
+    Return True nếu line là nav/support noise (không phải prose content).
+
+    Criteria:
+      1. Short line (≤ 4 words) containing nav/support vocabulary
+      2. Line matching known noise regex patterns
+      3. Pure punctuation/symbol lines with no letters
+    """
+    s = line.strip()
+    if not s:
+        return True
+
+    # Check regex patterns first (fast exit for known patterns)
+    for pat in _EDGE_NOISE_PATTERNS:
+        if pat.search(s):
+            return True
+
+    # Short line with nav vocabulary
+    words = s.lower().split()
+    if len(words) <= 4:
+        if any(w in _EDGE_NOISE_SHORT_WORDS for w in words):
+            return True
+        # Very short lines with no sentence-ending punctuation → likely label
+        if len(words) <= 2 and not re.search(r"[.!?,]$", s):
+            return True
+
+    # Pure symbols/numbers (stat artifacts like "92", "**4**")
+    if re.match(r"^[\*\d\s\-_#]+$", s) and len(s) <= 8:
+        return True
+
+    return False
+
+
+def _compute_edge_noise_penalty(content: str, edge_size: int = 10) -> float:
+    """
+    Compute quality penalty based on noise density in content edges.
+
+    Methodology (Trafilatura link_density approach, adapted for text-only):
+      - Sample first + last `edge_size` non-empty lines
+      - Count noise lines (nav labels, support buttons, author stats)
+      - No penalty below 0.20 threshold (some edge labels are expected)
+      - Linear penalty from 0 at 0.20 to 0.45 at 1.0
+
+    Args:
+        content:   Extracted text content
+        edge_size: Number of lines to sample from each edge (default: 10)
+
+    Returns:
+        Penalty float in [0.0, 0.45] to subtract from quality score.
+
+    Examples (with edge_size=10, total 20 edge lines sampled):
+        4/20 noise  (20%) → penalty = 0.00 (below threshold)
+        8/20 noise  (40%) → penalty = 0.11
+        12/20 noise (60%) → penalty = 0.23
+        16/20 noise (80%) → penalty = 0.34
+        20/20 noise (100%)→ penalty = 0.45
+    """
+    if not content:
+        return 0.0
+
+    lines = [l for l in content.splitlines() if l.strip()]
+    if len(lines) < edge_size * 2:
+        # Too short to sample both edges meaningfully
+        return 0.0
+
+    edge_lines  = lines[:edge_size] + lines[-edge_size:]
+    noise_count = sum(1 for l in edge_lines if _is_edge_noise_line(l))
+    ratio       = noise_count / len(edge_lines)
+
+    # No penalty below threshold
+    if ratio <= 0.20:
+        return 0.0
+
+    # Linear penalty: (ratio - 0.20) / 0.80 × 0.45
+    penalty = (ratio - 0.20) / 0.80 * 0.45
+    return round(min(0.45, penalty), 4)
 
 
 # ── Candidate score record ────────────────────────────────────────────────────
@@ -132,9 +225,6 @@ def _find_title_selectors(soup: BeautifulSoup) -> list[str]:
 # ── Fetch strategy scorer ─────────────────────────────────────────────────────
 
 def _score_fetch_strategy(config: PipelineConfig, is_js_heavy: bool) -> float:
-    """
-    Fix P2-16: tính resource score cho fetch strategy độc lập với eval content.
-    """
     steps      = config.fetch_chain.steps
     first_type = steps[0].type if steps else "hybrid"
 
@@ -169,7 +259,6 @@ class PipelineGenerator:
         next_sels    = _find_next_selectors(soup1)
         title_sels   = _find_title_selectors(soup1)
 
-        # P1-B: dùng _CONTENT_JS_RATIO, _JS_MIN_DIFF_CHARS từ config
         is_js_heavy = False
         if curl_html_ch1:
             curl_len = len(BeautifulSoup(curl_html_ch1, "html.parser").get_text())
@@ -332,6 +421,7 @@ class PipelineEvaluator:
 
     Fix P2-12: candidates chạy SONG SONG bằng asyncio.gather().
     Fix P2-16: resource_score được tính từ _score_fetch_strategy().
+    Fix OPTIMIZER-A: noise penalty applied per-chapter trước khi average.
     """
 
     async def evaluate(
@@ -410,7 +500,21 @@ class PipelineEvaluator:
                 )
                 if ctx.content and len(ctx.content.strip()) >= 100:
                     chapters_ok += 1
-                    total_scores.append(ctx.get_pipeline_score())
+
+                    # Fix OPTIMIZER-A: compute noise penalty và apply vào quality
+                    score_dict    = dict(ctx.get_pipeline_score())
+                    noise_penalty = _compute_edge_noise_penalty(ctx.content)
+                    if noise_penalty > 0:
+                        adjusted_quality = max(0.0, score_dict["quality"] - noise_penalty)
+                        score_dict["quality"] = round(adjusted_quality, 3)
+                        logger.debug(
+                            "[Optimizer] %s noise_penalty=%.3f quality: %.3f→%.3f",
+                            config.notes or "?", noise_penalty,
+                            score_dict["quality"] + noise_penalty,
+                            score_dict["quality"],
+                        )
+
+                    total_scores.append(score_dict)
                 else:
                     errors.append(f"{url[:40]}: no content")
             except asyncio.CancelledError:
@@ -465,7 +569,6 @@ async def run_optimizer(
 
     candidates = generator.generate(domain=domain, chapters=chapters, curl_html_ch1=curl_html_ch1)
 
-    # P1-B: dùng _CONTENT_JS_RATIO, _JS_MIN_DIFF_CHARS từ config
     is_js_heavy = bool(
         curl_html_ch1
         and len(BeautifulSoup(chapters[0][1], "html.parser").get_text()) >

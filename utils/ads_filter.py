@@ -1,21 +1,4 @@
-"""
-utils/ads_filter.py — Ads/watermark filtering system.
 
-Two-tier system:
-  Tier 1 (Frequency): text xuất hiện >= auto_threshold lần → auto-add
-  Tier 2 (AI verify): text xuất hiện 2-4 lần → gửi AI xác nhận
-
-Public API:
-    AdsFilter.load(domain)                → AdsFilter
-    filter.filter(content, chapter_url)   → str (cleaned)
-    filter.scan_edges_for_suspects(...)   → None
-    filter.get_candidates_by_frequency()  → (auto_list, ai_list)
-    filter.get_new_frequency_suspects()   → list[str]
-    filter.apply_verified(lines)          → int (added count)
-    filter.inject_from_profile(profile)   → int (injected count)
-    filter.save()                         → None
-    AdsFilter.post_process_directory(lines, dir) → int (removed count)
-"""
 from __future__ import annotations
 
 import json
@@ -32,14 +15,20 @@ logger = logging.getLogger(__name__)
 _MIN_LINE_LEN = 10
 _MAX_LINE_LEN = 300
 
+# Inline suspect thresholds (Q2 confirmed)
+_INLINE_AI_THRESHOLD   = 3   # >= 3 files → AI verify
+_INLINE_AUTO_THRESHOLD = 8   # >= 8 files → auto-add
+
 
 class AdsFilter:
 
     def __init__(self, domain: str, known_keywords: set[str]) -> None:
         self._domain   = domain
-        self._keywords : set[str] = known_keywords    # confirmed ads
-        self._suspects : Counter  = Counter()          # line → frequency in files
-        self._file_counter: Counter = Counter()        # line → number of files seen
+        self._keywords : set[str] = known_keywords
+        self._suspects : Counter  = Counter()
+        self._file_counter: Counter = Counter()
+        # Fix ADS-A: separate counter for inline (middle-of-content) occurrences
+        self._inline_file_counter: Counter = Counter()
         self._pending_review: dict = {}
         self._new_suspects: set[str] = set()
 
@@ -47,7 +36,6 @@ class AdsFilter:
 
     @classmethod
     def load(cls, domain: str) -> "AdsFilter":
-        """Load confirmed ads từ disk + domain-specific keywords."""
         global_kws: set[str] = set()
         domain_kws: set[str] = set()
 
@@ -64,7 +52,6 @@ class AdsFilter:
         return cls(domain=domain, known_keywords=global_kws | domain_kws)
 
     def inject_from_profile(self, profile: dict) -> int:
-        """Thêm ads_keywords_learned từ profile vào filter."""
         kws = profile.get("ads_keywords_learned") or []
         before = len(self._keywords)
         for kw in kws:
@@ -75,7 +62,6 @@ class AdsFilter:
     # ── Filtering ─────────────────────────────────────────────────────────────
 
     def filter(self, content: str, chapter_url: str = "") -> str:
-        """Remove known ads/watermark lines từ content."""
         if not self._keywords:
             return content
 
@@ -96,10 +82,7 @@ class AdsFilter:
         chapter_url : str = "",
         chapter_file: str = "",
     ) -> None:
-        """
-        Quét đầu/cuối chapter để tìm suspect lines (potential watermarks).
-        Lines xuất hiện nhiều lần qua nhiều chapters → candidate cho AI verify.
-        """
+        """Quét đầu/cuối chapter để tìm suspect lines."""
         lines = [l.strip() for l in content.splitlines() if l.strip()]
         if not lines:
             return
@@ -114,6 +97,64 @@ class AdsFilter:
                     self._suspects[lo] += 1
                     self._file_counter[lo] += 1
 
+    def scan_inline_for_watermarks(
+        self,
+        content    : str,
+        chapter_file: str = "",
+        edge_skip  : int = 5,
+    ) -> None:
+        """
+        [NEW — Fix ADS-A] Quét phần GIỮA content để detect inline watermarks.
+
+        Logic: A line appearing in the MIDDLE of content across multiple chapters
+        cannot be story content → it's a watermark injected by the site.
+
+        Cross-chapter comparison (user Q2):
+          - >= _INLINE_AI_THRESHOLD (3) files → AI verify candidate
+          - >= _INLINE_AUTO_THRESHOLD (8) files → auto-add without AI
+
+        Tracking: _inline_file_counter counts each unique line ONCE per file,
+        regardless of how many times it appears in that file. This gives a
+        true "appears in N chapters" count for threshold comparison.
+
+        Args:
+            content:      Extracted chapter content (post-ads-filter)
+            chapter_file: Path of chapter file (for logging, not used in counting)
+            edge_skip:    Lines to skip at start/end (these are covered by
+                          scan_edges_for_suspects already)
+        """
+        lines = [l.strip() for l in content.splitlines() if l.strip()]
+        n     = len(lines)
+
+        # Need enough lines to have a meaningful "middle"
+        if n < edge_skip * 2 + 2:
+            return
+
+        # Middle = skip first and last edge_skip lines
+        middle_lines = lines[edge_skip: n - edge_skip]
+
+        # Track which lines we've already counted for THIS chapter
+        # (count each line once per chapter, not once per occurrence)
+        seen_in_chapter: set[str] = set()
+
+        for line in middle_lines:
+            lo = line.lower()
+
+            # Basic length filter
+            if not (_MIN_LINE_LEN <= len(lo) <= _MAX_LINE_LEN):
+                continue
+
+            # Skip already-confirmed ads
+            if lo in self._keywords:
+                continue
+
+            # Skip lines we've already counted for this chapter
+            if lo in seen_in_chapter:
+                continue
+
+            seen_in_chapter.add(lo)
+            self._inline_file_counter[lo] += 1
+
     # ── Candidate retrieval ───────────────────────────────────────────────────
 
     def get_candidates_by_frequency(
@@ -124,15 +165,29 @@ class AdsFilter:
     ) -> tuple[list[str], list[str]]:
         """
         Returns (auto_candidates, ai_candidates).
-        auto: >= auto_threshold occurrences
-        ai:   >= min_count but < auto_threshold
+        auto: >= auto_threshold occurrences (edge OR inline)
+        ai:   >= min_count but < auto_threshold (edge OR inline)
+
+        Fix ADS-A: inline suspects contribute with 1.5× weight since
+        inline is a stronger signal than edge occurrence (inline lines
+        in multiple chapters are almost certainly watermarks, not nav).
         """
         auto: list[str] = []
         ai  : list[str] = []
+        seen: set[str]  = set()
 
-        for line, count in self._suspects.most_common(max_results * 2):
-            if line in self._keywords:
+        # Combine edge + inline suspects with inline boost
+        combined: Counter = Counter()
+        combined.update(self._suspects)
+        for line, count in self._inline_file_counter.items():
+            # 1.5× weight for inline (stronger watermark signal)
+            combined[line] = combined.get(line, 0) + int(count * 1.5)
+
+        for line, count in combined.most_common(max_results * 2):
+            if line in self._keywords or line in seen:
                 continue
+            seen.add(line)
+
             if count >= auto_threshold:
                 auto.append(line)
             elif count >= min_count:
@@ -148,22 +203,44 @@ class AdsFilter:
         min_files  : int = 5,
         max_results: int = 20,
     ) -> list[str]:
-        """Lines xuất hiện trong >= min_files chapters, chưa confirmed."""
+        """
+        Lines xuất hiện trong >= min_files chapters, chưa confirmed.
+
+        Fix ADS-A: Also surface inline suspects with lower threshold
+        (_INLINE_AI_THRESHOLD = 3) since inline = stronger signal.
+        Inline threshold override: max(3, min_files // 2).
+        """
         result: list[str] = []
+        seen  : set[str]  = set()
+
+        # Edge suspects (original behavior)
         for line, count in self._file_counter.most_common():
-            if line in self._keywords:
+            if line in self._keywords or line in seen:
                 continue
             if count >= min_files:
+                seen.add(line)
                 result.append(line)
                 self._new_suspects.add(line)
             if len(result) >= max_results:
                 break
-        return result
+
+        # Fix ADS-A: Inline suspects with lower threshold
+        inline_threshold = max(_INLINE_AI_THRESHOLD, min_files // 2)
+        for line, count in self._inline_file_counter.most_common():
+            if line in self._keywords or line in seen:
+                continue
+            if count >= inline_threshold:
+                seen.add(line)
+                result.append(line)
+                self._new_suspects.add(line)
+            if len(result) >= max_results:
+                break
+
+        return result[:max_results]
 
     # ── Applying verified results ─────────────────────────────────────────────
 
     def apply_verified(self, lines: list[str]) -> int:
-        """Add confirmed ads lines. Returns count of newly added."""
         added = 0
         for line in lines:
             lo = line.lower().strip()
@@ -177,14 +254,12 @@ class AdsFilter:
         domain_slug     : str,
         verified_results: dict | None = None,
     ) -> None:
-        """Save pending review dict (không bắt buộc — chỉ để debug)."""
         if verified_results:
             self._pending_review.update(verified_results)
 
     # ── Persistence ───────────────────────────────────────────────────────────
 
     def save(self) -> None:
-        """Save confirmed ads xuống ads_keywords.json."""
         try:
             os.makedirs(os.path.dirname(os.path.abspath(ADS_DB_FILE)), exist_ok=True)
             data: dict = {}
@@ -192,7 +267,6 @@ class AdsFilter:
                 with open(ADS_DB_FILE, "r", encoding="utf-8") as f:
                     data = json.load(f)
 
-            # Merge domain keywords
             existing = set(data.get(self._domain, []))
             merged   = sorted(existing | self._keywords)
             data[self._domain] = merged
@@ -205,16 +279,16 @@ class AdsFilter:
 
     @property
     def stats(self) -> str:
-        return f"known={len(self._keywords)} suspects={len(self._suspects)}"
+        return (
+            f"known={len(self._keywords)} "
+            f"edge_suspects={len(self._suspects)} "
+            f"inline_suspects={len(self._inline_file_counter)}"
+        )
 
     # ── Post-processing ───────────────────────────────────────────────────────
 
     @staticmethod
     def post_process_directory(confirmed_lines: list[str], output_dir: str) -> int:
-        """
-        Xóa confirmed ads lines khỏi tất cả .md files trong directory.
-        Returns tổng số dòng đã xóa.
-        """
         if not confirmed_lines or not os.path.isdir(output_dir):
             return 0
 

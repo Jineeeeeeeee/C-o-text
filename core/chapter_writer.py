@@ -4,17 +4,18 @@ core/chapter_writer.py — Chapter filename formatting và content post-processi
 Fix P2-11: lru_cache cho _get_chapter_re() thay vì re.compile() trong hot path.
 
 Fix FILENAME-B: Bỏ has_chapter_subtitle gate.
-  Trước: subtitle chỉ được include vào filename khi has_chapter_subtitle=True.
-         "Chapter 23: Interlude 1" với has_chapter_subtitle=False → "0023_Chapter23.md"
-         → Hai chapter khác nhau có thể cùng tên file.
-  Sau:   Subtitle luôn được dùng khi có.
-         Logic: nếu có subtitle → chỉ dùng subtitle (số thứ tự 0023 đã là prefix).
-                nếu không có   → keyword+number là identifier.
 
-  "Chapter 23: Interlude 1" → "0023_Interlude_1.md"   (unique)
-  "Chapter 23"              → "0023_Chapter23.md"     (no subtitle fallback)
-  "Prologue"                → "0001_Prologue.md"      (no keyword match)
-  "Chapter 1"               → "0001_Chapter1.md"      (no subtitle)
+Fix FILENAME-C: _is_garbage_subtitle() guard.
+  Trước: subtitle "a percy jackson fanfic" (FFN descriptor) bị dùng làm filename
+         → "0001_a_percy_jackson_and_the_olympians_fanfic.md" thay vì "0001_Chapter1.md"
+  Sau:   validate subtitle trước khi dùng. Subtitle khớp fanfic descriptor, translator
+         credit, hoặc quá dài mà không có dấu câu → treat as no subtitle → fallback
+         về keyword+number.
+
+  Garbage subtitle patterns:
+    - "a {fandom} fanfic" / "a {fandom} fanfiction" (FFN format)
+    - "translated by ..." / "edited by ..."
+    - Dài > 60 chars mà không có dấu câu tự nhiên (.) (!) (?) (,)
 """
 from __future__ import annotations
 
@@ -34,6 +35,48 @@ _RE_WORD_COUNT = re.compile(
 )
 
 _NAV_EDGE_SCAN = 7
+
+
+# ── Garbage subtitle detection (Fix FILENAME-C) ────────────────────────────────
+
+_GARBAGE_SUBTITLE_PATTERNS = (
+    # FFN format: "a percy jackson and the olympians fanfic"
+    re.compile(r"^a\s+\S.{2,70}\s+fanfic(?:tion)?\s*$", re.IGNORECASE),
+    # Translator / editor credit
+    re.compile(r"^translated\s+by\b", re.IGNORECASE),
+    re.compile(r"^edited\s+by\b",     re.IGNORECASE),
+    # Site artifact formats
+    re.compile(r"^(?:official\s+)?(?:epub|pdf|translation)\b", re.IGNORECASE),
+)
+
+
+def _is_garbage_subtitle(sub: str) -> bool:
+    """
+    Return True nếu subtitle không phải chapter subtitle thật sự.
+
+    Fix FILENAME-C: ngăn FFN fanfic descriptor và translator credits
+    bị dùng làm filename thay vì chapter keyword+number.
+
+    Cases:
+      "a percy jackson fanfic"       → True  (FFN descriptor)
+      "translated by SomeTranslator" → True  (translator credit)
+      "The Rise of Heroes"           → False (real subtitle)
+      "Interlude 1"                  → False (real subtitle)
+      "A very long subtitle without any natural punctuation whatsoever in it" → True
+    """
+    if not sub or len(sub) < 2:
+        return True
+
+    # Check explicit patterns
+    for pat in _GARBAGE_SUBTITLE_PATTERNS:
+        if pat.match(sub.strip()):
+            return True
+
+    # Long with no natural punctuation → likely site artifact
+    if len(sub) > 60 and not re.search(r"[.!?,;:'\"()]", sub):
+        return True
+
+    return False
 
 
 # ── Cached regex factory ───────────────────────────────────────────────────────
@@ -61,20 +104,21 @@ def format_chapter_filename(
     """
     Tạo tên file .md cho một chapter.
 
-    Logic (Fix FILENAME-B):
-        1. Bóc story prefix nếu có (VD: "Monster Cultivator Chapter 5" → "Chapter 5")
-        2. Parse chapter keyword + số
-        3. Nếu có subtitle → dùng CHỈ subtitle làm tên file
-           (số thứ tự 0000 đã là prefix duy nhất, tránh "0023_Chapter23_Chapter23")
-        4. Nếu không có subtitle → dùng keyword+number
-        5. Fallback: slugify toàn bộ title
+    Logic (Fix FILENAME-B + Fix FILENAME-C):
+        1. Bóc story prefix nếu có
+        2. Bóc pipe suffix
+        3. Parse chapter keyword + số
+        4. Validate subtitle: nếu là garbage → fallback về keyword+number
+        5. Nếu subtitle thật → dùng CHỈ subtitle làm tên file
+        6. Nếu không có subtitle → keyword+number
+        7. Fallback: slugify toàn bộ title
 
     Examples:
-        "Chapter 23: Interlude 1" → "0023_Interlude_1.md"
-        "Chapter 23"              → "0023_Chapter23.md"
-        "Prologue: The Beginning" → "0001_Prologue_The_Beginning.md"
-        "Prologue"                → "0001_Prologue.md"
-        "Interlude 1"             → "0023_Interlude_1.md"  (no keyword match → full title)
+        "Chapter 23: Interlude 1"                   → "0023_Interlude_1.md"
+        "Chapter 1, a percy jackson fanfic"          → "0001_Chapter1.md"   (Fix C)
+        "Chapter 23"                                 → "0023_Chapter23.md"
+        "Prologue: The Beginning"                    → "0001_Prologue_The_Beginning.md"
+        "Prologue"                                   → "0001_Prologue.md"
     """
     chapter_kw   = (progress.get("chapter_keyword") or "Chapter").strip()
     prefix_strip = (progress.get("story_prefix_strip") or "").strip()
@@ -99,20 +143,19 @@ def format_chapter_filename(
         sub_raw = m.group("sub").strip(" -–—:[]().")
         sub_raw = _RE_PIPE_SUFFIX.sub("", sub_raw).strip()
 
-        if sub_raw and len(sub_raw) >= 2:
-            # Fix FILENAME-B: có subtitle → dùng CHỈ subtitle.
+        # Fix FILENAME-C: validate subtitle trước khi dùng
+        if sub_raw and len(sub_raw) >= 2 and not _is_garbage_subtitle(sub_raw):
+            # Subtitle thật → dùng CHỈ subtitle.
             # "Chapter 23: Interlude 1" → "0023_Interlude_1.md"
-            # Không prefix "Chapter23_" vì 0023 đã là unique identifier.
             name = f"{chapter_num:04d}_{slugify_filename(sub_raw, max_len=80)}"
         else:
-            # Không có subtitle → keyword+number là identifier duy nhất.
+            # Garbage subtitle hoặc không có → keyword+number là identifier.
+            # "Chapter 1, a percy jackson fanfic" → "0001_Chapter1.md"
             # "Chapter 23" → "0023_Chapter23.md"
             chap_id = f"{chapter_kw}{n}"
             name    = f"{chapter_num:04d}_{chap_id}"
     else:
         # Không match chapter keyword → dùng toàn bộ title.
-        # "Prologue" → "0001_Prologue.md"
-        # "Interlude 1" → "0001_Interlude_1.md"
         fallback = (title or raw_title).strip()
         name     = f"{chapter_num:04d}_{slugify_filename(fallback, max_len=80)}"
 

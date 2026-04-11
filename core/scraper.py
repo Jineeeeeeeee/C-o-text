@@ -286,6 +286,7 @@ async def scrape_one_chapter(
     await write_markdown(filepath, f"# {title}\n\n{content}\n")
 
     ads_filter.scan_edges_for_suspects(content, chapter_url=url, chapter_file=filepath)
+    ads_filter.scan_inline_for_watermarks(content, chapter_file=filepath)
 
     progress["chapter_count"]    = chapter_num
     progress["last_title"]       = title
