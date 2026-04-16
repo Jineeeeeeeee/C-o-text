@@ -30,6 +30,12 @@ FIX-CANCEL: asyncio.shield() cho save_progress trong except CancelledError.
          → progress KHÔNG được lưu dù đã vào except block.
   Sau:  asyncio.shield(save_progress(...)) bảo vệ save khỏi bị cancel.
         Nếu shield timeout: log warning, raise CancelledError như bình thường.
+
+v21 fixes:
+  - Ads filter double-pass: filter() TRƯỚC strip_nav_edges, sau đó filter lần nữa SAU.
+  - Deduplicate title: nếu dòng đầu content == title → bỏ dòng đó.
+  - find_start_chapter: heuristic fallback khi AI thất bại hoàn toàn.
+  - clean_title_trailing_dash() trong normalize_title() (string_helpers.py).
 """
 from __future__ import annotations
 
@@ -161,6 +167,26 @@ async def find_start_chapter(
                 progress["start_url"] = start_url
                 return found, progress
 
+    # Heuristic fallback: lấy link chapter đầu tiên từ HTML khi AI thất bại
+    # Regex match href có pattern chapter/chap/c/s/số
+    _CHAPTER_HREF_RE = re.compile(
+        r"/(?:chapter|chuong|chap|c|ch)[_\-]?\d+"
+        r"|/s/\d+/\d+"
+        r"|/(?:episode|ep|part)[_\-]?\d+",
+        re.IGNORECASE,
+    )
+    from bs4 import BeautifulSoup as _BS
+    _hsoup = _BS(html, "html.parser")
+    for a in _hsoup.find_all("a", href=True):
+        href = a["href"]
+        if _CHAPTER_HREF_RE.search(href):
+            from urllib.parse import urljoin
+            full = urljoin(start_url, href)
+            if full != start_url:
+                print(f"  [{tag}] ⚡ Heuristic fallback → {full[:65]}", flush=True)
+                progress["start_url"] = start_url
+                return full, progress
+
     raise RuntimeError(f"Không tìm được điểm bắt đầu: {start_url}")
 
 
@@ -252,9 +278,15 @@ async def scrape_one_chapter(
             ai_limiter, html=html, soup=ctx.soup, issue_reporter=issue_reporter,
         )
 
+    # Ads filter pass 1: TRƯỚC strip_nav_edges — bắt ads ở đầu/cuối content gốc
+    content = ads_filter.filter(content, chapter_url=url)
+
     stripped = strip_nav_edges(content)
     if stripped and len(stripped.strip()) >= 100:
         content = stripped
+
+    # Ads filter pass 2: SAU strip_nav_edges — bắt ads edge mới lộ ra sau strip
+    content = ads_filter.filter(content, chapter_url=url)
 
     if title and re.fullmatch(r"Chapter \d+", title):
         issue_reporter.report(
@@ -263,7 +295,13 @@ async def scrape_one_chapter(
             chapter_num=progress.get("chapter_count", 0) + 1,
         )
 
-    content = ads_filter.filter(content, chapter_url=url)
+    # Deduplicate title: nếu dòng đầu content giống title → bỏ đi
+    # (NovelFire h1 bị grab vào content, scraper lại ghi "# {title}" riêng)
+    content_lines = content.split('\n')
+    if content_lines:
+        first_line = content_lines[0].strip().lstrip('#').strip()
+        if first_line and title and first_line.lower() == title.lower():
+            content = '\n'.join(content_lines[1:]).lstrip('\n')
 
     fp = make_fingerprint(content)
     if fp in fingerprints:

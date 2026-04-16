@@ -83,11 +83,21 @@ _WORD_COUNT_ARTIFACT = re.compile(
 )
 
 
+# Trailing dash patterns: "The Primal Hunter-" → "The Primal Hunter"
+_TRAILING_DASH = re.compile(r"[\-–—]+\s*$")
+
+
+def clean_title_trailing_dash(text: str) -> str:
+    """Strip trailing -, –, — (và whitespace) từ cuối title."""
+    return _TRAILING_DASH.sub("", text).strip()
+
+
 def normalize_title(text: str) -> str:
     if not text:
         return ""
     text = re.sub(r"[\x00-\x1f\x7f]", "", text)
     text = re.sub(r"[ \t]+", " ", text).strip()
+    text = clean_title_trailing_dash(text)
     return text
 
 

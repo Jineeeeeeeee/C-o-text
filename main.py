@@ -301,19 +301,6 @@ async def main() -> None:
             on_chapter_done = app.inc_total,
         )
 
-    async def _task(url: str, idx: int) -> None:
-        await asyncio.sleep(idx * INIT_STAGGER)
-        await run_novel_task(
-            start_url       = url,
-            output_dir      = _output_dir(url),
-            progress_path   = _progress_path(url),
-            pool            = pool,
-            pw_pool         = app.pw_pool,
-            pm              = pm,
-            ai_limiter      = app.ai_limiter,
-            on_chapter_done = app.inc_total,
-        )
-
     cancelled = False
     try:
         results = await asyncio.gather(
@@ -345,4 +332,28 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    # Suppress Windows asyncio cleanup noise ("I/O operation on closed pipe"
+    # xuất hiện khi ProactorEventLoop dọn dẹp transport lúc thoát chương trình).
+    if sys.platform == "win32":
+        _loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(_loop)
+
+        def _silence_transport_errors(loop, context):
+            msg = context.get("message", "")
+            exc = context.get("exception")
+            exc_str = str(exc) if exc else ""
+            if any(kw in msg.lower() or kw in exc_str.lower() for kw in (
+                "i/o operation on closed",
+                "transport",
+                "pipe",
+            )):
+                return  # suppress silently
+            loop.default_exception_handler(context)
+
+        _loop.set_exception_handler(_silence_transport_errors)
+        try:
+            _loop.run_until_complete(main())
+        finally:
+            _loop.close()
+    else:
+        asyncio.run(main())

@@ -25,6 +25,18 @@ if not GEMINI_API_KEY:
 
 GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
 
+# ── Fallback model khi model chính bị 503 kéo dài ────────────────────────────
+# Nếu không set, tự tính: flash-lite nếu model chính là flash/pro, không đổi nếu đã là flash-lite.
+def _derive_fallback(primary: str) -> str:
+    _p = primary.lower()
+    if "flash-lite" in _p:
+        return primary  # đã là lite rồi, giữ nguyên
+    if "flash" in _p or "pro" in _p:
+        return "gemini-2.0-flash-lite"
+    return "gemini-2.0-flash-lite"
+
+GEMINI_FALLBACK_MODEL: str = os.getenv("GEMINI_FALLBACK_MODEL", _derive_fallback(GEMINI_MODEL))
+
 # ── Giới hạn scraper ──────────────────────────────────────────────────────────
 MAX_CHAPTERS             = 5000
 MAX_CONSECUTIVE_ERRORS   = 5

@@ -22,15 +22,15 @@ from urllib.parse import urljoin
 
 from bs4 import BeautifulSoup
 
-from config import GEMINI_MODEL, RE_NEXT_BTN
+from config import GEMINI_MODEL, GEMINI_FALLBACK_MODEL, RE_NEXT_BTN
 from ai.client  import ai_client, AIRateLimiter
 from ai.prompts import Prompts
 
 
 # ── Retry infrastructure ──────────────────────────────────────────────────────
 
-_MAX_RETRIES   = 3
-_RETRY_BACKOFF = [30, 60]
+_MAX_RETRIES   = 5
+_RETRY_BACKOFF = [30, 60, 120, 240]
 
 
 def _is_retriable(e: Exception) -> bool:
@@ -53,8 +53,13 @@ async def _call(
     prompt: str,
     limiter: AIRateLimiter,
     schema: dict[str, Any] | None = None,
+    *,
+    _use_fallback: bool = False,
 ) -> str | None:
     await limiter.acquire()
+    model = GEMINI_FALLBACK_MODEL if _use_fallback else GEMINI_MODEL
+    last_retriable_err: Exception | None = None
+
     for attempt in range(_MAX_RETRIES):
         try:
             if schema:
@@ -64,11 +69,11 @@ async def _call(
                     response_schema=schema,
                 )
                 resp = await ai_client.aio.models.generate_content(
-                    model=GEMINI_MODEL, contents=prompt, config=config,
+                    model=model, contents=prompt, config=config,
                 )
             else:
                 resp = await ai_client.aio.models.generate_content(
-                    model=GEMINI_MODEL, contents=prompt,
+                    model=model, contents=prompt,
                 )
             return resp.text
         except asyncio.CancelledError:
@@ -79,17 +84,33 @@ async def _call(
             if schema and ("response_schema" in err_str or "mime_type" in err_str):
                 try:
                     resp = await ai_client.aio.models.generate_content(
-                        model=GEMINI_MODEL, contents=prompt,
+                        model=model, contents=prompt,
                     )
                     return resp.text
                 except Exception:
                     return None
-            if _is_retriable(e) and not is_last:
-                wait = _RETRY_BACKOFF[min(attempt, len(_RETRY_BACKOFF) - 1)]
-                print(f"  [AI] ⚠ Retriable error (lần {attempt+1}), thử lại sau {wait}s: {_fmt(e)[:80]}", flush=True)
-                await asyncio.sleep(wait)
+            if _is_retriable(e):
+                last_retriable_err = e
+                if not is_last:
+                    wait = _RETRY_BACKOFF[min(attempt, len(_RETRY_BACKOFF) - 1)]
+                    suffix = f" [{model}]" if _use_fallback else ""
+                    print(
+                        f"  [AI] ⚠ Retriable error (lần {attempt+1}/{_MAX_RETRIES}){suffix},"
+                        f" thử lại sau {wait}s: {_fmt(e)[:80]}",
+                        flush=True,
+                    )
+                    await asyncio.sleep(wait)
             else:
                 raise
+
+    # Tất cả retries thất bại với retriable error → thử fallback model (một lần)
+    if last_retriable_err is not None and not _use_fallback and GEMINI_FALLBACK_MODEL != GEMINI_MODEL:
+        print(
+            f"  [AI] 🔄 Model chính ({GEMINI_MODEL}) hết retry → thử fallback ({GEMINI_FALLBACK_MODEL})...",
+            flush=True,
+        )
+        return await _call(prompt, limiter, schema, _use_fallback=True)
+
     return None
 
 

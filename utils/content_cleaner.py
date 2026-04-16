@@ -315,6 +315,49 @@ def _strip_author_bio(text: str) -> str:
     return text
 
 
+# ── Pass 6: Static UI navigation text patterns ────────────────────────────────
+#
+# Bổ sung cho ads_filter (dynamic). Pass này là static — hardcoded patterns phổ biến.
+# Belt-and-suspenders: ads_filter học từ dữ liệu, pass này là safety net.
+
+_UI_NAV_PATTERNS: list[re.Pattern] = [
+    re.compile(r"^restore scroll position\s*$",                     re.I),
+    re.compile(r"^tap the middle of the screen to reveal",          re.I),
+    re.compile(r"^tip\s*:\s*you can use left.*right.*keyboard",     re.I),
+    re.compile(r"^share to your friends\s*$",                       re.I),
+    re.compile(r"^if you find any errors.*let us know\s*",          re.I),
+    re.compile(r"^report chapter\s*$",                              re.I),
+    re.compile(r"^report error\s*$",                                re.I),
+    re.compile(r"^support the (author|translator|series)\s*$",      re.I),
+    re.compile(r"^add to library\s*$",                              re.I),
+    re.compile(r"^send gift\s*$",                                   re.I),
+    re.compile(r"^vote for this chapter\s*$",                       re.I),
+    re.compile(r"^unlock.*chapter\s*$",                             re.I),
+    re.compile(r"^locked chapter\s*$",                              re.I),
+    re.compile(r"^read more at\b",                                  re.I),
+    re.compile(r"^visit.*for the latest",                           re.I),
+    re.compile(r"^the source of this content is\b",                 re.I),
+    re.compile(r"^this content is taken from",                      re.I),
+    re.compile(r"^please read this on the (original|official)",     re.I),
+    re.compile(r"^if you want to read more chapters.*follow.*on",   re.I),
+]
+
+
+def _strip_ui_navigation_text(text: str) -> str:
+    """
+    Strip các dòng là UI navigation text phổ biến (static patterns).
+
+    Không có cutoff threshold — các pattern này rất đặc tưng, ít false positive.
+    """
+    if not text:
+        return text
+    lines = text.splitlines()
+    result = [line for line in lines
+              if not any(p.match(line.strip()) for p in _UI_NAV_PATTERNS)]
+    candidate = "\n".join(result)
+    return candidate if len(candidate.strip()) >= _MIN_REMAINING else text
+
+
 # ── Main entry point ──────────────────────────────────────────────────────────
 
 def clean_extracted_content(text: str) -> str:
@@ -328,6 +371,7 @@ def clean_extracted_content(text: str) -> str:
         3. _strip_postfix_section   (từ 35% trở xuống)
         4. _strip_metadata_header   (25 dòng đầu)
         5. _strip_author_bio        (từ 55% trở xuống)
+        6. _strip_ui_navigation_text (static UI patterns — bất kỳ vị trí)
 
     Conservative: không bao giờ return ít hơn 40% original content.
     """
@@ -337,12 +381,13 @@ def clean_extracted_content(text: str) -> str:
     original_len = len(text.strip())
     result       = text
 
-    result = _strip_raw_script_lines(result)   # Pass 0 (NEW)
-    result = _strip_comment_section(result)    # Pass 1
-    result = _strip_settings_panel(result)     # Pass 2
-    result = _strip_postfix_section(result)    # Pass 3
-    result = _strip_metadata_header(result)    # Pass 4
-    result = _strip_author_bio(result)         # Pass 5
+    result = _strip_raw_script_lines(result)    # Pass 0 (NEW)
+    result = _strip_comment_section(result)     # Pass 1
+    result = _strip_settings_panel(result)      # Pass 2
+    result = _strip_postfix_section(result)     # Pass 3
+    result = _strip_metadata_header(result)     # Pass 4
+    result = _strip_author_bio(result)          # Pass 5
+    result = _strip_ui_navigation_text(result)  # Pass 6 (NEW)
 
     cleaned_len = len(result.strip())
 
@@ -350,4 +395,4 @@ def clean_extracted_content(text: str) -> str:
     if cleaned_len < original_len * (1 - _MAX_STRIP_RATIO):
         return text
 
-    return result.strip() if result.strip() else text   
+    return result.strip() if result.strip() else text
