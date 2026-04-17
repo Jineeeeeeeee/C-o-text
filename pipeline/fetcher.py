@@ -1,37 +1,25 @@
 """
 pipeline/fetcher.py — Fetch blocks.
 
-v2 changes:
-  FETCH-1: Tất cả blocks đọc pool/pw_pool từ ctx.runtime thay vì
-           ctx.profile.get("_pool") (anti-pattern cũ).
+Batch B: Xóa to_config(), from_config(), make_fetch_block(), registry dict.
+  Blocks được instantiate trực tiếp bởi PipelineRunner._fetch_blocks().
 
-  FETCH-2: HybridFetchBlock._detect_js_fetch() KHÔNG còn mutate
-           ctx.profile["requires_playwright"] = True.
-           Thay vào đó: trả về BlockResult với metadata{"js_heavy": True}.
-           Executor đọc signal này, set ctx.detected_js_heavy = True.
-           Caller (scraper.py) quyết định có persist xuống profile không.
-
-  P1-B: _JS_CONTENT_RATIO và _JS_MIN_DIFF_CHARS được import từ config.py
-        thay vì hardcode tại đây. Một source of truth cho cả project.
-
-  FIX-STATUS: Tất cả BlockResult.success/fallback sau pool.fetch() đều truyền
-        status_code=status vào metadata. Executor đọc qua:
-            ctx.status_code = fetch_result.metadata.get("status_code", 200)
-        Thiếu field này khiến ctx.status_code luôn = 200 → 429/403 guards
-        trong scraper.py là dead code.
+Batch B: Xóa detect_js từ HybridFetchBlock.
+  JS-heavy detection xảy ra trong learning/phase.py._detect_js_heavy()
+  (so sánh curl vs playwright text length), kết quả lưu vào
+  profile.requires_playwright. detect_js mode trong block là dead code
+  sau khi optimizer bị xóa ở Batch A.
 
 Blocks:
     CurlFetchBlock       — curl_cffi Chrome TLS fingerprint (nhanh, ít RAM)
     PlaywrightFetchBlock — Playwright full browser (JS support)
-    HybridFetchBlock     — Thử curl trước, auto-fallback Playwright nếu CF.
-                           detect_js=True (learning mode): fetch cả 2, so sánh.
+    HybridFetchBlock     — curl first, auto-fallback Playwright nếu CF
 """
 from __future__ import annotations
 
 import asyncio
 import time
 
-from config import JS_CONTENT_RATIO as _JS_CONTENT_RATIO, JS_MIN_DIFF_CHARS as _JS_MIN_DIFF_CHARS
 from utils.string_helpers import is_cloudflare_challenge, is_junk_page
 from pipeline.base import (
     BlockType, BlockResult, PipelineContext, ScraperBlock,
@@ -73,12 +61,8 @@ class CurlFetchBlock(ScraperBlock):
                 )
 
             if is_junk_page(html, status):
-                return self._timed(
-                    BlockResult.failed(f"junk_page status={status}"),
-                    start,
-                )
+                return self._timed(BlockResult.failed(f"junk_page status={status}"), start)
 
-            # FIX-STATUS: truyền status_code vào metadata
             return self._timed(
                 BlockResult.success(
                     data        = html,
@@ -92,14 +76,10 @@ class CurlFetchBlock(ScraperBlock):
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            return self._timed(BlockResult.failed(str(e).strip() or repr(e), method_used="curl"), start)
-
-    def to_config(self) -> dict:
-        return {"type": self.name}
-
-    @classmethod
-    def from_config(cls, config: dict) -> "CurlFetchBlock":
-        return cls()
+            return self._timed(
+                BlockResult.failed(str(e).strip() or repr(e), method_used="curl"),
+                start,
+            )
 
 
 class PlaywrightFetchBlock(ScraperBlock):
@@ -124,12 +104,8 @@ class PlaywrightFetchBlock(ScraperBlock):
             status, html = await pw_pool.fetch(ctx.url)
 
             if is_junk_page(html, status):
-                return self._timed(
-                    BlockResult.failed(f"junk_page status={status}"),
-                    start,
-                )
+                return self._timed(BlockResult.failed(f"junk_page status={status}"), start)
 
-            # FIX-STATUS: truyền status_code vào metadata
             return self._timed(
                 BlockResult.success(
                     data        = html,
@@ -143,43 +119,28 @@ class PlaywrightFetchBlock(ScraperBlock):
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            return self._timed(BlockResult.failed(str(e).strip() or repr(e), method_used="playwright"), start)
-
-    def to_config(self) -> dict:
-        return {"type": self.name}
-
-    @classmethod
-    def from_config(cls, config: dict) -> "PlaywrightFetchBlock":
-        return cls()
+            return self._timed(
+                BlockResult.failed(str(e).strip() or repr(e), method_used="playwright"),
+                start,
+            )
 
 
 class HybridFetchBlock(ScraperBlock):
     """
     Smart fetch: curl first, auto-fallback Playwright khi cần.
 
-    Runtime flow (đã có profile):
+    Runtime flow:
         1. profile.requires_playwright = True → Playwright thẳng
         2. Domain đã flagged CF             → Playwright thẳng
         3. Thử curl → CF detected           → Playwright, flag domain
         4. curl thành công                  → trả về curl result
 
-    Learning mode (detect_js=True):
-        1. Fetch bằng CẢ curl VÀ Playwright
-        2. So sánh text content length
-        3. Nếu Playwright > curl × JS_CONTENT_RATIO AND diff > JS_MIN_DIFF_CHARS:
-           → Báo "js_heavy": True qua BlockResult.metadata
-           → Executor set ctx.detected_js_heavy = True
-           → Caller persist vào profile NẾU phù hợp
-           KHÔNG tự mutate ctx.profile — đó không phải việc của block.
-
-    P1-B: threshold _JS_CONTENT_RATIO, _JS_MIN_DIFF_CHARS import từ config.py.
-    FIX-STATUS: tất cả success/fallback paths đều truyền status_code vào metadata.
+    Batch B: Bỏ detect_js mode. JS-heavy detection đã được thực hiện
+    trong learning/phase.py._detect_js_heavy() và persist vào
+    profile.requires_playwright — không cần re-detect mỗi chapter.
     """
     block_type = BlockType.FETCH
     name       = "hybrid"
-
-    def __init__(self, detect_js: bool = False) -> None:
-        self.detect_js = detect_js
 
     async def execute(self, ctx: PipelineContext) -> BlockResult:
         start = time.monotonic()
@@ -206,7 +167,6 @@ class HybridFetchBlock(ScraperBlock):
                         BlockResult.failed(f"junk_page status={status}"),
                         start,
                     )
-                # FIX-STATUS
                 return self._timed(
                     BlockResult.success(
                         data        = html,
@@ -215,13 +175,6 @@ class HybridFetchBlock(ScraperBlock):
                         char_count  = len(html),
                         status_code = status,
                     ),
-                    start,
-                )
-
-            # Learning mode: detect JS-heavy
-            if self.detect_js:
-                return self._timed(
-                    await self._detect_js_fetch(ctx, pool, pw_pool, domain),
                     start,
                 )
 
@@ -235,7 +188,6 @@ class HybridFetchBlock(ScraperBlock):
                         BlockResult.failed(f"junk_page status={status}"),
                         start,
                     )
-                # FIX-STATUS
                 return self._timed(
                     BlockResult.success(
                         data        = html,
@@ -256,7 +208,6 @@ class HybridFetchBlock(ScraperBlock):
                         BlockResult.failed(f"junk_page status={status} (after CF)"),
                         start,
                     )
-                # FIX-STATUS
                 return self._timed(
                     BlockResult.fallback(
                         data        = html,
@@ -280,7 +231,6 @@ class HybridFetchBlock(ScraperBlock):
                             BlockResult.failed(f"junk_page status={status}"),
                             start,
                         )
-                    # FIX-STATUS
                     return self._timed(
                         BlockResult.fallback(
                             data        = html,
@@ -305,123 +255,8 @@ class HybridFetchBlock(ScraperBlock):
         except Exception as e:
             return self._timed(BlockResult.failed(str(e).strip() or repr(e)), start)
 
-    async def _detect_js_fetch(
-        self,
-        ctx   : PipelineContext,
-        pool,
-        pw_pool,
-        domain: str,
-    ) -> BlockResult:
-        """
-        Fetch bằng cả curl và Playwright để detect JS-heavy site.
-
-        Signal "js_heavy" được trả về trong BlockResult.metadata.
-        KHÔNG mutate ctx.profile — đó là việc của executor/caller.
-
-        P1-B: dùng _JS_CONTENT_RATIO, _JS_MIN_DIFF_CHARS từ config.py.
-        FIX-STATUS: track status từ cả curl và pw, dùng status của best result.
-        """
-        from bs4 import BeautifulSoup
-
-        curl_html = pw_html = ""
-        curl_ok   = pw_ok   = False
-        curl_status = pw_status = 200  # FIX-STATUS: track real status
-
-        try:
-            curl_status, curl_html = await pool.fetch(ctx.url)
-            curl_ok = (
-                not is_cloudflare_challenge(curl_html)
-                and not is_junk_page(curl_html, curl_status)
-            )
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            pass
-
-        try:
-            pw_status, pw_html = await pw_pool.fetch(ctx.url)
-            pw_ok = not is_junk_page(pw_html, pw_status)
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            pass
-
-        if not pw_ok and not curl_ok:
-            return BlockResult.failed("both curl and playwright failed")
-
-        def _text_len(html: str) -> int:
-            if not html:
-                return 0
-            try:
-                return len(BeautifulSoup(html, "html.parser").get_text())
-            except Exception:
-                return len(html)
-
-        curl_len = _text_len(curl_html) if curl_ok else 0
-        pw_len   = _text_len(pw_html)   if pw_ok   else 0
-
-        is_js_heavy = (
-            pw_ok and curl_ok
-            and pw_len > curl_len * _JS_CONTENT_RATIO
-            and (pw_len - curl_len) > _JS_MIN_DIFF_CHARS
-        )
-
-        if is_js_heavy:
-            print(
-                f"  [Hybrid] 🔍 JS-heavy detected on {domain}: "
-                f"curl={curl_len:,}c vs pw={pw_len:,}c "
-                f"(ratio={pw_len/max(curl_len,1):.1f}x)",
-                flush=True,
-            )
-
-        if curl_ok and is_cloudflare_challenge(curl_html):
-            pool.mark_cf_domain(domain)
-
-        # FIX-STATUS: chọn status của best result
-        best_html   = pw_html    if pw_ok   else curl_html
-        best_method = "playwright" if pw_ok else "curl"
-        best_status = pw_status  if pw_ok   else curl_status
-
-        return BlockResult.success(
-            data        = best_html,
-            method_used = f"hybrid_detect_{best_method}",
-            confidence  = 1.0,
-            char_count  = len(best_html),
-            status_code = best_status,
-            js_heavy    = is_js_heavy,
-            curl_len    = curl_len,
-            pw_len      = pw_len,
-        )
-
-    def to_config(self) -> dict:
-        return {"type": self.name, "detect_js": self.detect_js}
-
-    @classmethod
-    def from_config(cls, config: dict) -> "HybridFetchBlock":
-        return cls(detect_js=bool(config.get("detect_js", False)))
-
 
 # ── Internal sentinel ──────────────────────────────────────────────────────────
 
 class _CloudflareError(Exception):
     pass
-
-
-# ── Registry ───────────────────────────────────────────────────────────────────
-
-_FETCH_BLOCK_MAP: dict[str, type[ScraperBlock]] = {
-    "curl"      : CurlFetchBlock,
-    "playwright": PlaywrightFetchBlock,
-    "hybrid"    : HybridFetchBlock,
-}
-
-
-def make_fetch_block(config: dict) -> ScraperBlock:
-    block_type = config.get("type", "hybrid")
-    cls = _FETCH_BLOCK_MAP.get(block_type)
-    if cls is None:
-        raise ValueError(
-            f"Unknown fetch block type: {block_type!r}. "
-            f"Available: {list(_FETCH_BLOCK_MAP)}"
-        )
-    return cls.from_config(config)

@@ -1,9 +1,8 @@
 """
 pipeline/navigator.py — Navigation blocks.
 
-v2 changes:
-  NAV-1: AINavBlock đọc ai_limiter từ ctx.runtime.ai_limiter thay vì
-         ctx.profile.get("_ai_limiter").
+Batch B: Xóa to_config(), from_config(), make_nav_block(), registry dict.
+  Blocks được instantiate trực tiếp bởi PipelineRunner._nav_blocks().
 
 Blocks (theo thứ tự ưu tiên):
     RelNextNavBlock       — <link rel="next"> / <a rel="next">  (chuẩn nhất)
@@ -60,13 +59,6 @@ class RelNextNavBlock(ScraperBlock):
         except Exception as e:
             return self._timed(BlockResult.failed(str(e) or repr(e)), start)
 
-    def to_config(self) -> dict:
-        return {"type": self.name}
-
-    @classmethod
-    def from_config(cls, config: dict) -> "RelNextNavBlock":
-        return cls()
-
 
 # ── 2. Selector Nav ───────────────────────────────────────────────────────────
 
@@ -121,16 +113,6 @@ class SelectorNavBlock(ScraperBlock):
         except Exception as e:
             return self._timed(BlockResult.failed(str(e) or repr(e)), start)
 
-    def to_config(self) -> dict:
-        d: dict = {"type": self.name}
-        if self.selector:
-            d["selector"] = self.selector
-        return d
-
-    @classmethod
-    def from_config(cls, config: dict) -> "SelectorNavBlock":
-        return cls(selector=config.get("selector"))
-
 
 # ── 3. Anchor Text Nav ────────────────────────────────────────────────────────
 
@@ -167,13 +149,6 @@ class AnchorTextNavBlock(ScraperBlock):
         except Exception as e:
             return self._timed(BlockResult.failed(str(e) or repr(e)), start)
 
-    def to_config(self) -> dict:
-        return {"type": self.name}
-
-    @classmethod
-    def from_config(cls, config: dict) -> "AnchorTextNavBlock":
-        return cls()
-
 
 # ── 4. Slug Increment ─────────────────────────────────────────────────────────
 
@@ -201,13 +176,6 @@ class SlugIncrementNavBlock(ScraperBlock):
             raise
         except Exception as e:
             return self._timed(BlockResult.failed(str(e) or repr(e)), start)
-
-    def to_config(self) -> dict:
-        return {"type": self.name}
-
-    @classmethod
-    def from_config(cls, config: dict) -> "SlugIncrementNavBlock":
-        return cls()
 
 
 # ── 5. Fanfic Nav ─────────────────────────────────────────────────────────────
@@ -245,20 +213,12 @@ class FanficNavBlock(ScraperBlock):
         except Exception as e:
             return self._timed(BlockResult.failed(str(e) or repr(e)), start)
 
-    def to_config(self) -> dict:
-        return {"type": self.name}
-
-    @classmethod
-    def from_config(cls, config: dict) -> "FanficNavBlock":
-        return cls()
-
 
 # ── 6. Select Dropdown Nav ────────────────────────────────────────────────────
 
 class SelectDropdownNavBlock(ScraperBlock):
     """
     Tìm next chapter từ <select> dropdown.
-
     Logic: tìm <option selected>, lấy <option> kế tiếp trong DOM.
     Fallback: tìm option có value khớp URL hiện tại.
     """
@@ -339,16 +299,6 @@ class SelectDropdownNavBlock(ScraperBlock):
         except Exception as e:
             return self._timed(BlockResult.failed(str(e) or repr(e)), start)
 
-    def to_config(self) -> dict:
-        d: dict = {"type": self.name}
-        if self.select_selector:
-            d["select_selector"] = self.select_selector
-        return d
-
-    @classmethod
-    def from_config(cls, config: dict) -> "SelectDropdownNavBlock":
-        return cls(select_selector=config.get("select_selector"))
-
 
 # ── 7. AI Nav Block ───────────────────────────────────────────────────────────
 
@@ -356,7 +306,6 @@ class AINavBlock(ScraperBlock):
     """
     AI fallback navigation.
     Chỉ dùng khi tất cả heuristic blocks thất bại.
-    Đọc ai_limiter từ ctx.runtime — không còn ctx.profile["_ai_limiter"].
     """
     block_type = BlockType.NAVIGATE
     name       = "ai_nav"
@@ -392,34 +341,3 @@ class AINavBlock(ScraperBlock):
             raise
         except Exception as e:
             return self._timed(BlockResult.failed(str(e) or repr(e)), start)
-
-    def to_config(self) -> dict:
-        return {"type": self.name}
-
-    @classmethod
-    def from_config(cls, config: dict) -> "AINavBlock":
-        return cls()
-
-
-# ── Registry ───────────────────────────────────────────────────────────────────
-
-_NAV_BLOCK_MAP: dict[str, type[ScraperBlock]] = {
-    "rel_next"       : RelNextNavBlock,
-    "selector"       : SelectorNavBlock,
-    "anchor_text"    : AnchorTextNavBlock,
-    "slug_increment" : SlugIncrementNavBlock,
-    "fanfic"         : FanficNavBlock,
-    "select_dropdown": SelectDropdownNavBlock,
-    "ai_nav"         : AINavBlock,
-}
-
-
-def make_nav_block(config: dict) -> ScraperBlock:
-    block_type = config.get("type", "anchor_text")
-    cls = _NAV_BLOCK_MAP.get(block_type)
-    if cls is None:
-        raise ValueError(
-            f"Unknown nav block type: {block_type!r}. "
-            f"Available: {list(_NAV_BLOCK_MAP)}"
-        )
-    return cls.from_config(config)

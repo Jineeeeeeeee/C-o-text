@@ -1,24 +1,12 @@
 """
 pipeline/validator.py — Content validation blocks.
 
-v2 changes:
-  VAL-1: ProseRichnessBlock dùng max() thay vì overwrite ctx.validation_score.
-         Trước: score từ LengthValidatorBlock bị xóa sổ hoàn toàn.
-         Sau: cả hai blocks contribute, lấy score cao nhất.
-
-Fix M7: ProseRichnessBlock đọc CAO_NO_VALIDATION env var.
-  Khi --no-validation được truyền qua CLI, main.py set CAO_NO_VALIDATION=1.
-  ProseRichnessBlock tự skip (trả về SKIPPED thay vì chạy scoring).
-  LengthValidatorBlock vẫn chạy bình thường — đây là safety net cơ bản
-  để tránh ghi file rỗng, không nên tắt.
-
-  Lý do đặt logic trong block (không phải executor):
-  Block tự quyết định có chạy không dựa trên context của nó.
-  Executor không nên biết về business logic của từng block.
+Batch B: Xóa to_config(), from_config(), make_validate_block(), registry dict.
+  Blocks được instantiate trực tiếp bởi PipelineRunner._validate_blocks().
 
 Blocks:
     LengthValidatorBlock   — content đủ dài (min_chars) — LUÔN chạy
-    ProseRichnessBlock     — content là văn xuôi thật — có thể skip qua flag
+    ProseRichnessBlock     — content là văn xuôi thật — có thể skip qua CAO_NO_VALIDATION
     FingerprintDedupBlock  — content không trùng lặp chapter đã cào
 """
 from __future__ import annotations
@@ -36,9 +24,7 @@ from pipeline.base import BlockType, BlockResult, PipelineContext, ScraperBlock
 class LengthValidatorBlock(ScraperBlock):
     """
     content.strip() >= min_chars.
-
-    Luôn chạy kể cả khi CAO_NO_VALIDATION=1 — đây là safety net
-    cơ bản để tránh ghi file rỗng hoặc quá ngắn vào disk.
+    Luôn chạy kể cả khi CAO_NO_VALIDATION=1 — safety net cơ bản.
     """
     block_type = BlockType.VALIDATE
     name       = "length"
@@ -76,31 +62,14 @@ class LengthValidatorBlock(ScraperBlock):
             start,
         )
 
-    def to_config(self) -> dict:
-        return {"type": self.name, "min_chars": self.min_chars}
-
-    @classmethod
-    def from_config(cls, config: dict) -> "LengthValidatorBlock":
-        return cls(min_chars=int(config.get("min_chars", 100)))
-
 
 # ── 2. Prose Richness ─────────────────────────────────────────────────────────
 
 class ProseRichnessBlock(ScraperBlock):
     """
     Content là văn xuôi thật — không phải navigation/ads dump.
-
-    Fix M7: skip toàn bộ nếu CAO_NO_VALIDATION=1 (--no-validation flag).
-    Env var được đọc tại thời điểm execute() — không cache ở __init__
-    để tránh trường hợp flag được set sau khi block đã được khởi tạo
-    (VD: trong test hoặc khi reload config).
-
-    Score từ 5 dimensions:
-        1. word_count           >= min_word_count
-        2. avg_sentence_length  trong prose range [5, 50] words
-        3. paragraph_density    blank gaps / line count
-        4. caps_line_ratio      < 0.3 (ít ALL_CAPS = ít nav/ads)
-        5. unique_word_ratio    > 0.3 (đa dạng từ vựng = thật)
+    Skip toàn bộ nếu CAO_NO_VALIDATION=1 (--no-validation flag).
+    Env var được đọc tại execute() để hỗ trợ set sau init.
     """
     block_type = BlockType.VALIDATE
     name       = "prose_richness"
@@ -115,9 +84,7 @@ class ProseRichnessBlock(ScraperBlock):
     async def execute(self, ctx: PipelineContext) -> BlockResult:
         start = time.monotonic()
 
-        # Fix M7: đọc flag tại execute time, không phải init time
         if os.getenv("CAO_NO_VALIDATION") == "1":
-            # Không set ctx.is_valid = False — giữ nguyên kết quả từ LengthValidatorBlock
             return self._timed(
                 BlockResult.skipped("CAO_NO_VALIDATION=1 (--no-validation flag)"),
                 start,
@@ -216,13 +183,6 @@ class ProseRichnessBlock(ScraperBlock):
 
         return round(sum(scores) / len(scores), 3), notes
 
-    def to_config(self) -> dict:
-        return {"type": self.name, "min_word_count": self.min_word_count}
-
-    @classmethod
-    def from_config(cls, config: dict) -> "ProseRichnessBlock":
-        return cls(min_word_count=int(config.get("min_word_count", 20)))
-
 
 # ── 3. Fingerprint Dedup ──────────────────────────────────────────────────────
 
@@ -262,30 +222,3 @@ class FingerprintDedupBlock(ScraperBlock):
             raise
         except Exception as e:
             return self._timed(BlockResult.failed(str(e) or repr(e)), start)
-
-    def to_config(self) -> dict:
-        return {"type": self.name}
-
-    @classmethod
-    def from_config(cls, config: dict) -> "FingerprintDedupBlock":
-        return cls()
-
-
-# ── Registry ───────────────────────────────────────────────────────────────────
-
-_VALIDATE_BLOCK_MAP: dict[str, type[ScraperBlock]] = {
-    "length"           : LengthValidatorBlock,
-    "prose_richness"   : ProseRichnessBlock,
-    "fingerprint_dedup": FingerprintDedupBlock,
-}
-
-
-def make_validate_block(config: dict) -> ScraperBlock:
-    block_type = config.get("type", "length")
-    cls = _VALIDATE_BLOCK_MAP.get(block_type)
-    if cls is None:
-        raise ValueError(
-            f"Unknown validate block type: {block_type!r}. "
-            f"Available: {list(_VALIDATE_BLOCK_MAP)}"
-        )
-    return cls.from_config(config)

@@ -2,8 +2,10 @@
 """
 utils/types.py — TypedDict definitions cho toàn bộ project.
 
-v2: Bổ sung pipeline fields vào SiteProfile.
-    Backward compatible — tất cả pipeline fields là Optional.
+Batch B: Xóa pipeline/optimizer_score/requires_relearn/migration_notes khỏi SiteProfile.
+  Các fields này chỉ được dùng bởi PipelineConfig serialization và migrator.py
+  — cả hai đã bị xóa trong Batch B.
+  profile_version giữ lại như metadata vô hại.
 """
 from __future__ import annotations
 from typing import Any, Optional, TypedDict
@@ -38,9 +40,9 @@ class SiteProfile(TypedDict, total=False):
     domain               : str
     last_learned         : str
     confidence           : float
-    profile_version      : int          # 1=legacy, 2=pipeline architecture
+    profile_version      : int          # Metadata — kept for reference
 
-    # ── Legacy selector fields (v1) — giữ cho backward compat ────────────────
+    # ── Selector fields ───────────────────────────────────────────────────────
     content_selector     : Optional[str]
     next_selector        : Optional[str]
     title_selector       : Optional[str]
@@ -53,17 +55,9 @@ class SiteProfile(TypedDict, total=False):
     learned_chapters     : list[int]
     sample_urls          : list[str]
 
-    # ── Pipeline config (v2) ─────────────────────────────────────────────────
-    # Dict với cấu trúc PipelineConfig.to_dict()
-    # None = chưa có pipeline (cần learning hoặc dùng default)
-    pipeline             : Optional[dict]
-    optimizer_score      : float        # Score từ PipelineEvaluator
-    requires_relearn     : bool         # True = migration thất bại, cần relearn
-    migration_notes      : Optional[str]
-
     # ── Debug / meta ──────────────────────────────────────────────────────────
     uncertain_fields     : list[str]
-    learning_version     : int          # 1=5-call, 2=10-call
+    learning_version     : int          # 1=5-call, 2=8-call (Batch A), 3=future
 
 
 # ── Progress ──────────────────────────────────────────────────────────────────

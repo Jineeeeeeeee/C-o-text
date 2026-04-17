@@ -1,21 +1,15 @@
 """
 pipeline/title_extractor.py — Title extraction blocks.
 
-Fix TITLE-A: SelectorTitleBlock apply strip_site_suffix() cho TẤT CẢ elements.
-  Trước: chỉ apply khi el.name == "title" (HTML <title> tag).
-  Sau:   apply unconditionally vì strip_site_suffix() cũng strip
-         _WORD_COUNT_ARTIFACT ("[ ... words ]") và _FANFIC_DESCRIPTOR
-         — các artifacts xuất hiện trong bất kỳ element nào (h1, h2, selector).
-  VD: NovelFire h1:nth-of-type(2) trả về "Chapter 25: Enjoying life[ ... words ]"
-      → sau fix: "Chapter 25: Enjoying life"
+Batch B: Xóa to_config(), from_config(), make_title_block(), registry dict.
+  Blocks được instantiate trực tiếp bởi PipelineRunner._title_blocks().
 
+Fix TITLE-A: SelectorTitleBlock apply strip_site_suffix() unconditionally.
 Fix TITLE-B: H1TitleBlock apply strip_site_suffix() trước normalize_title().
-  Trước: normalize_title(el.get_text()) — không strip word count artifacts.
-  Sau:   normalize_title(strip_site_suffix(el.get_text())) — strip trước.
 
-Blocks (theo thứ tự ưu tiên trong default chain):
+Blocks (theo thứ tự ưu tiên trong title_vote chain):
     SelectorTitleBlock  — CSS selector từ profile (chính xác nhất)
-    H1TitleBlock        — <h1> tag (phổ biến nhất)
+    H1TitleBlock        — <h1> tag
     TitleTagBlock       — <title> tag, stripped site suffix
     OgTitleBlock        — og:title meta, stripped site suffix
     UrlSlugTitleBlock   — Extract từ URL slug (fallback cuối)
@@ -63,16 +57,12 @@ class SelectorTitleBlock(ScraperBlock):
 
             raw = el.get_text(strip=True)
 
-            # Fix TITLE-A: Apply strip_site_suffix() unconditionally.
-            # strip_site_suffix() handles:
-            #   - Site name suffixes ("| Royal Road", "| FanFiction")
-            #   - FFN fanfic descriptor (", a {fandom} fanfic")
-            #   - Word count artifacts ("[ ... words ]", "[1,234 words]")
-            # Tất cả đều có thể xuất hiện trong bất kỳ title element nào,
-            # không chỉ riêng HTML <title> tag.
-            raw = strip_site_suffix(raw)
-
+            # Fix TITLE-A: Apply strip_site_suffix() unconditionally — handles
+            # site name suffixes, FFN fanfic descriptors, AND word count artifacts
+            # ("[ ... words ]") which appear in any element, not just <title>.
+            raw  = strip_site_suffix(raw)
             text = normalize_title(raw)
+
             if len(text) < _MIN_TITLE_LEN:
                 return self._timed(
                     BlockResult.failed(f"title too short: {text!r}"),
@@ -91,16 +81,6 @@ class SelectorTitleBlock(ScraperBlock):
             raise
         except Exception as e:
             return self._timed(BlockResult.failed(str(e) or repr(e)), start)
-
-    def to_config(self) -> dict:
-        d: dict = {"type": self.name}
-        if self.selector:
-            d["selector"] = self.selector
-        return d
-
-    @classmethod
-    def from_config(cls, config: dict) -> "SelectorTitleBlock":
-        return cls(selector=config.get("selector"))
 
 
 # ── 2. H1 Title Block ─────────────────────────────────────────────────────────
@@ -139,13 +119,6 @@ class H1TitleBlock(ScraperBlock):
             raise
         except Exception as e:
             return self._timed(BlockResult.failed(str(e) or repr(e)), start)
-
-    def to_config(self) -> dict:
-        return {"type": self.name}
-
-    @classmethod
-    def from_config(cls, config: dict) -> "H1TitleBlock":
-        return cls()
 
 
 # ── 3. Title Tag Block ────────────────────────────────────────────────────────
@@ -189,13 +162,6 @@ class TitleTagBlock(ScraperBlock):
         except Exception as e:
             return self._timed(BlockResult.failed(str(e) or repr(e)), start)
 
-    def to_config(self) -> dict:
-        return {"type": self.name}
-
-    @classmethod
-    def from_config(cls, config: dict) -> "TitleTagBlock":
-        return cls()
-
 
 # ── 4. OG Title Block ─────────────────────────────────────────────────────────
 
@@ -238,13 +204,6 @@ class OgTitleBlock(ScraperBlock):
         except Exception as e:
             return self._timed(BlockResult.failed(str(e) or repr(e)), start)
 
-    def to_config(self) -> dict:
-        return {"type": self.name}
-
-    @classmethod
-    def from_config(cls, config: dict) -> "OgTitleBlock":
-        return cls()
-
 
 # ── 5. URL Slug Title Block ───────────────────────────────────────────────────
 
@@ -272,33 +231,3 @@ class UrlSlugTitleBlock(ScraperBlock):
             raise
         except Exception as e:
             return self._timed(BlockResult.failed(str(e) or repr(e)), start)
-
-    def to_config(self) -> dict:
-        return {"type": self.name}
-
-    @classmethod
-    def from_config(cls, config: dict) -> "UrlSlugTitleBlock":
-        return cls()
-
-
-# ── Registry ──────────────────────────────────────────────────────────────────
-
-_TITLE_BLOCK_MAP: dict[str, type[ScraperBlock]] = {
-    "selector" : SelectorTitleBlock,
-    "h1_tag"   : H1TitleBlock,
-    "title_tag": TitleTagBlock,
-    "og_title" : OgTitleBlock,
-    "url_slug" : UrlSlugTitleBlock,
-}
-
-
-def make_title_block(config: dict) -> ScraperBlock:
-    """Factory: tạo title block từ StepConfig dict."""
-    block_type = config.get("type", "h1_tag")
-    cls = _TITLE_BLOCK_MAP.get(block_type)
-    if cls is None:
-        raise ValueError(
-            f"Unknown title block type: {block_type!r}. "
-            f"Available: {list(_TITLE_BLOCK_MAP)}"
-        )
-    return cls.from_config(config)

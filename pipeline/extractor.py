@@ -1,18 +1,8 @@
 """
 pipeline/extractor.py — Content extraction blocks.
 
-v2 changes:
-  EXT-1: AIExtractBlock được implement thật — không còn luôn trả về SKIPPED.
-         Gọi Gemini để extract content khi mọi heuristic đều thất bại.
-         Đây là "last resort" thật sự, không phải stub.
-
-  EXT-2: FallbackListExtractBlock bỏ "body text" fallback.
-         extract_plain_text(body) trên toàn bộ <body> lấy ra nav, footer,
-         ads, script text — garbage. Tốt hơn là fail rõ ràng và để
-         AIExtractBlock xử lý.
-
-  EXT-3: AIExtractBlock đọc ai_limiter từ ctx.runtime — không còn
-         ctx.profile.get("_ai_limiter").
+Batch B: Xóa to_config(), from_config(), make_extract_block(), registry dict.
+  Blocks được instantiate trực tiếp bởi PipelineRunner._extract_blocks().
 
 Blocks:
     SelectorExtractBlock     — CSS selector từ profile (fastest)
@@ -20,7 +10,7 @@ Blocks:
     DensityHeuristicBlock    — Text density scoring (works on any site)
     XPathExtractBlock        — XPath alternative
     FallbackListExtractBlock — Known selector list
-    AIExtractBlock           — Gemini AI extraction (last resort, REAL)
+    AIExtractBlock           — Gemini AI extraction (last resort)
 """
 from __future__ import annotations
 
@@ -96,28 +86,13 @@ class SelectorExtractBlock(ScraperBlock):
         except Exception as e:
             return self._timed(BlockResult.failed(str(e) or repr(e)), start)
 
-    def to_config(self) -> dict:
-        d: dict[str, Any] = {"type": self.name}
-        if self.selector:
-            d["selector"] = self.selector
-        if self.min_chars != _MIN_CONTENT_CHARS:
-            d["min_chars"] = self.min_chars
-        return d
-
-    @classmethod
-    def from_config(cls, config: dict) -> "SelectorExtractBlock":
-        return cls(
-            selector  = config.get("selector"),
-            min_chars = int(config.get("min_chars", _MIN_CONTENT_CHARS)),
-        )
-
 
 # ── 2. JSON-LD Extract ────────────────────────────────────────────────────────
 
 class JsonLdExtractBlock(ScraperBlock):
     """
     Extract từ JSON-LD Article/BlogPosting schema.
-    Không cần CSS selector — works even when DOM structure changes.
+    Works even when DOM structure changes.
     """
     block_type = BlockType.EXTRACT
     name       = "json_ld"
@@ -170,13 +145,6 @@ class JsonLdExtractBlock(ScraperBlock):
         except Exception as e:
             return self._timed(BlockResult.failed(str(e) or repr(e)), start)
 
-    def to_config(self) -> dict:
-        return {"type": self.name}
-
-    @classmethod
-    def from_config(cls, config: dict) -> "JsonLdExtractBlock":
-        return cls()
-
 
 # ── 3. Density Heuristic ──────────────────────────────────────────────────────
 
@@ -184,8 +152,7 @@ class DensityHeuristicBlock(ScraperBlock):
     """
     Trafilatura-style: tìm block có mật độ text cao nhất.
     score = text_density × (1 - link_density) × log(text_len + 1)
-
-    Works on any site without any selector knowledge.
+    Works on any site without selector knowledge.
     """
     block_type = BlockType.EXTRACT
     name       = "density_heuristic"
@@ -278,16 +245,6 @@ class DensityHeuristicBlock(ScraperBlock):
         )
         return score, text_len
 
-    def to_config(self) -> dict:
-        d: dict[str, Any] = {"type": self.name}
-        if self.min_chars != _MIN_CONTENT_CHARS:
-            d["min_chars"] = self.min_chars
-        return d
-
-    @classmethod
-    def from_config(cls, config: dict) -> "DensityHeuristicBlock":
-        return cls(min_chars=int(config.get("min_chars", _MIN_CONTENT_CHARS)))
-
 
 # ── 4. XPath Extract ──────────────────────────────────────────────────────────
 
@@ -344,29 +301,13 @@ class XPathExtractBlock(ScraperBlock):
         except Exception as e:
             return self._timed(BlockResult.failed(str(e) or repr(e)), start)
 
-    def to_config(self) -> dict:
-        d: dict[str, Any] = {"type": self.name, "xpath": self.xpath}
-        if self.min_chars != _MIN_CONTENT_CHARS:
-            d["min_chars"] = self.min_chars
-        return d
-
-    @classmethod
-    def from_config(cls, config: dict) -> "XPathExtractBlock":
-        return cls(
-            xpath     = config.get("xpath", "//article"),
-            min_chars = int(config.get("min_chars", _MIN_CONTENT_CHARS)),
-        )
-
 
 # ── 5. Fallback List Extract ──────────────────────────────────────────────────
 
 class FallbackListExtractBlock(ScraperBlock):
     """
     Thử lần lượt FALLBACK_CONTENT_SELECTORS đã biết.
-
-    Không còn "body text" fallback — extract_plain_text(<body>) là garbage
-    vì nó kéo cả nav/footer/ads vào. Thất bại rõ ràng tốt hơn garbage.
-    Nếu fallback list cũng fail → AIExtractBlock sẽ xử lý.
+    Không còn "body text" fallback — AIExtractBlock xử lý case đó.
     """
     block_type = BlockType.EXTRACT
     name       = "fallback_list"
@@ -406,7 +347,6 @@ class FallbackListExtractBlock(ScraperBlock):
                 except Exception:
                     continue
 
-            # KHÔNG fallback sang body text — AIExtractBlock xử lý case này
             return self._timed(
                 BlockResult.failed("all known selectors exhausted"),
                 start,
@@ -416,34 +356,13 @@ class FallbackListExtractBlock(ScraperBlock):
         except Exception as e:
             return self._timed(BlockResult.failed(str(e) or repr(e)), start)
 
-    def to_config(self) -> dict:
-        d: dict[str, Any] = {"type": self.name}
-        if self.extra_selectors:
-            d["extra_selectors"] = self.extra_selectors
-        return d
-
-    @classmethod
-    def from_config(cls, config: dict) -> "FallbackListExtractBlock":
-        return cls(
-            extra_selectors = config.get("extra_selectors", []),
-            min_chars       = int(config.get("min_chars", _MIN_CONTENT_CHARS)),
-        )
-
 
 # ── 6. AI Extract Block ───────────────────────────────────────────────────────
 
 class AIExtractBlock(ScraperBlock):
     """
-    AI-powered content extraction — last resort THẬT SỰ.
-
-    Gọi Gemini để identify và extract chapter content khi tất cả
-    heuristic blocks thất bại. Đây là "last resort" thật, không phải stub.
-
-    Confidence thấp hơn selector (0.75) vì AI có thể miss formatting
-    đặc biệt (tables, system boxes, v.v.) mà profile-based extraction
-    sẽ xử lý tốt hơn.
-
-    Đọc ai_limiter từ ctx.runtime — không còn ctx.profile["_ai_limiter"].
+    AI-powered content extraction — last resort thật sự.
+    Gọi Gemini khi tất cả heuristic blocks thất bại.
     """
     block_type = BlockType.EXTRACT
     name       = "ai_extract"
@@ -478,7 +397,7 @@ class AIExtractBlock(ScraperBlock):
                 )
 
             return self._timed(
-                BlockResult.fallback(   # fallback vì không từ learned selector
+                BlockResult.fallback(
                     data        = content.strip(),
                     method_used = "ai_extract",
                     confidence  = 0.75,
@@ -491,13 +410,6 @@ class AIExtractBlock(ScraperBlock):
         except Exception as e:
             return self._timed(BlockResult.failed(str(e) or repr(e)), start)
 
-    def to_config(self) -> dict:
-        return {"type": self.name}
-
-    @classmethod
-    def from_config(cls, config: dict) -> "AIExtractBlock":
-        return cls()
-
 
 # ── Utility ────────────────────────────────────────────────────────────────────
 
@@ -507,26 +419,3 @@ def _format_element(el: Tag, formatting_rules: dict | None) -> str:
     if formatting_rules:
         return MarkdownFormatter(formatting_rules).format(el)
     return extract_plain_text(el)
-
-
-# ── Registry ───────────────────────────────────────────────────────────────────
-
-_EXTRACT_BLOCK_MAP: dict[str, type[ScraperBlock]] = {
-    "selector"         : SelectorExtractBlock,
-    "json_ld"          : JsonLdExtractBlock,
-    "density_heuristic": DensityHeuristicBlock,
-    "xpath"            : XPathExtractBlock,
-    "fallback_list"    : FallbackListExtractBlock,
-    "ai_extract"       : AIExtractBlock,
-}
-
-
-def make_extract_block(config: dict) -> ScraperBlock:
-    block_type = config.get("type", "fallback_list")
-    cls = _EXTRACT_BLOCK_MAP.get(block_type)
-    if cls is None:
-        raise ValueError(
-            f"Unknown extract block type: {block_type!r}. "
-            f"Available: {list(_EXTRACT_BLOCK_MAP)}"
-        )
-    return cls.from_config(config)

@@ -44,13 +44,10 @@ FetchChain     → ExtractChain → TitleChain → NavChain → ValidateChain
 **Key classes:**
 | Class | File | Role |
 |---|---|---|
-| `PipelineConfig` | `pipeline/base.py` | Serializable pipeline spec (5 `ChainConfig`s) |
 | `PipelineRunner` | `pipeline/executor.py` | Executes config against a URL |
 | `ChainExecutor` | `pipeline/executor.py` | Runs one chain; handles title_vote mode |
-| `PipelineContext` | `pipeline/base.py` | Mutable state during one chapter's execution |
 | `RuntimeContext` | `pipeline/base.py` | Non-serializable live objects (pools, limiter) |
 | `BlockResult` | `pipeline/base.py` | Output of each block execution |
-| `StepConfig` | `pipeline/base.py` | Serializable config for one block step |
 
 ### 2.2 Serialization Format (CRITICAL — Fix M4)
 
@@ -99,7 +96,6 @@ crawl_novel/
 │   │                           #   _build_final_profile()
 │   ├── phase_ai.py             # run_10_ai_calls_internal() — 10 AI call orchestration
 │   ├── profile_manager.py      # ProfileManager — thread-safe profile CRUD
-│   ├── migrator.py             # v1→v2 migration, needs_migration(), migrate_profile()
 │   └── naming.py               # run_naming_phase() — story name + chapter keyword
 │
 ├── core/
@@ -152,15 +148,8 @@ Persisted in `data/site_profiles.json`, keyed by domain.
     "formatting_rules": {...},
     "ads_keywords_learned": [...],
 
-    # Pipeline fields (v2)
-    "pipeline": { ... PipelineConfig.to_dict() ... },
-    "optimizer_score": 0.873,
-    "requires_relearn": False,
 }
 ```
-
-**Migration**: `needs_migration()` checks `profile.get("profile_version", 1) < 2`.
-After migration, `profile_version` is set to `2`.
 
 ### 4.2 ProgressDict (utils/types.py)
 Persisted per-story in `progress/{domain}_{slug}_{hash}.json`.
@@ -319,11 +308,10 @@ Uses `_get_chapter_re()` with `@lru_cache` (Fix P2-11 — hot path).
 ## 12. Critical Bugs Fixed (Reference)
 
 ### P0 — Critical
-- **M4**: `StepConfig.to_dict()` nested params — MUST use `{"type": ..., "params": {...}}`. Old flat format silently ignored all learned selectors.
-- **P0-B**: `needs_migration()` reads `profile_version` (top-level), NOT `pipeline.optimizer_version`.
 - **P0-2**: `ProfileManager.get()` returns shallow copy — never a live reference.
 - **P0-4**: HTTP 429 removed from `_JUNK_STATUSES` — rate limit is temporary, not permanent error.
 FIX-ADSSAVE: AdsFilter.save() concurrent write corruption (threading.Lock + atomic write + corrupt file recovery).
+- Batch B: Xóa PipelineConfig serialization roundtrip — PipelineRunner đọc SiteProfile flat fields trực tiếp
 ### P1 — High
 - **P1-A**: 429 with empty HTML raises `RuntimeError` (triggers retry), not silent `return None` (would terminate story).
 - **P1-B**: `JS_CONTENT_RATIO` and `JS_MIN_DIFF_CHARS` in `config.py` — single source of truth.
@@ -363,9 +351,6 @@ ctx.profile["requires_playwright"] = True  # Use metadata signal instead
 # ❌ read live profile reference
 profile = pm.get(domain)
 profile["x"] = y  # mutates internal state — always copy
-
-# ❌ Serialize with to_config()
-# to_config() is DEBUG/INTROSPECTION ONLY. Real serialization: StepConfig.to_dict()
 
 # ❌ Catch CancelledError in generic except
 try:
@@ -419,7 +404,6 @@ MAX_CHAPTERS = 5000             # Safety cap per story
 MAX_CONSECUTIVE_ERRORS = 5      # Stop after N consecutive errors
 PW_MAX_CONCURRENCY = 2          # Playwright instances (CLI overridable)
 ```
---fast-learning      # No-op sau Batch A (optimizer đã bỏ)
 ### CLI Options
 ```bash
 python main.py links.txt
